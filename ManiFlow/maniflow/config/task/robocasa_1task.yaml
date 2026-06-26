@@ -1,0 +1,46 @@
+name: robocasa_1task_TurnOffMicrowave
+
+shape_meta:
+  obs:
+    image:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${n_obs_steps}
+    agent_pos:
+      shape: [9]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [7]
+
+# データセット実パス: robocasa/datasets/v1.0/pretrain/atomic/TurnOffMicrowave
+# download_datasets が <task>/<date>/lerobot/ に展開するため、
+# _resolve_lerobot_root() が自動的に正しいパスを探す。
+dataset_base_path: /home/bilgehan.sakai/Flow_Policy/robocasa/datasets/v1.0/pretrain/atomic
+
+dataset:
+  _target_: maniflow.dataset.robocasa_dataset.RoboCasaImageDataset
+  dataset_dirs:
+    - ${task.dataset_base_path}/TurnOffMicrowave
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: ${training.seed}
+  val_ratio: 0.05
+  camera_name: robot0_agentview_left
+  image_size: 224
+  task_name: ${name}
+
+env_runner:
+  _target_: maniflow.env_runner.robocasa_runner.RoboCasaRunner
+  task_name: TurnOffMicrowave
+  eval_episodes: 3
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  num_open_loop_steps: 16
+  camera_name: robot0_agentview_left
+  image_size: 224
+  obj_instance_split: pretrain   # 学習データと同じ split で動作確認
+  max_episode_steps: 100         # 短縮（動作確認用）
+  fps: 20
+  tqdm_interval_sec: 1.0

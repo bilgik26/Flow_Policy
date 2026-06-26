@@ -1,0 +1,83 @@
+[project]
+name = "flow-policy-robocasa"
+version = "0.1.0"
+description = "Flow_Policy with RoboCasa support"
+requires-python = ">=3.10,<3.11"
+
+# Base dependencies (CPU versions — override with [cu128] extra for GPU)
+dependencies = [
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "torchaudio==2.7.0",
+    # Flow_Policy core
+    "hydra-core==1.2.0",
+    "omegaconf>=2.2",
+    "wandb",
+    "zarr==2.12.0",
+    "einops==0.8.1",
+    "timm",
+    "transformers==4.46.1",
+    "diffusers==0.27.2",
+    "accelerate==0.34.2",
+    "deepspeed==0.15.1",
+    # Data / image
+    "numpy<2.0",
+    "pandas",
+    "pyarrow",
+    "av",               # PyAV for mp4 decoding
+    "opencv-python-headless",
+    "imageio",
+    "imageio-ffmpeg",
+    "Pillow",
+    # Utils
+    "tqdm",
+    "termcolor",
+    "dill",
+    "scikit-learn",
+    "scipy",
+    "matplotlib",
+    "tensorboard",
+    # RoboCasa eval
+    "mujoco==3.3.1",
+    "numba==0.63.1",
+    "llvmlite==0.46.0",
+    "lerobot",          # for video_utils used by robocasa
+    # Flash attention (optional, comment out if build fails)
+    # "flash-attn",
+]
+
+[project.optional-dependencies]
+# CUDA 12.8 wheel overrides — used with: uv sync --extra cu128
+cu128 = [
+    "torch==2.7.0+cu128",
+    "torchvision==0.22.0+cu128",
+    "torchaudio==2.7.0+cu128",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", extra = "cu128" },
+]
+torchvision = [
+    { index = "pytorch-cu128", extra = "cu128" },
+]
+torchaudio = [
+    { index = "pytorch-cu128", extra = "cu128" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[dependency-groups]
+robocasa = [
+    # Installed in editable mode via uv pip install -e
+    # After uv sync, run:
+    #   uv pip install 'robosuite @ git+https://github.com/ARISE-Initiative/robosuite.git'
+    #   uv pip install -e robocasa/
+    #   uv pip install -e ManiFlow/
+]

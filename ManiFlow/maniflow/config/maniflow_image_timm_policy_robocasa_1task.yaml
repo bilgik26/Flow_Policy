@@ -1,0 +1,129 @@
+defaults:
+  - task: robocasa_1task
+
+name: train_maniflow_robocasa_1task
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "robocasa_1task"
+
+horizon: 34
+n_obs_steps: 2
+n_action_steps: 32
+obs_as_global_cond: true
+
+policy:
+  _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
+  block_type: "DiTX"
+  n_layer: 6
+  n_head: 4
+  n_emb: 256
+  visual_cond_len: 256
+  max_lang_cond_len: 256
+  qkv_bias: false
+  qk_norm: false
+  language_conditioned: false
+  pre_norm_modality: false
+  flow_batch_ratio: 0.75
+  consistency_batch_ratio: 0.25
+  sample_t_mode_flow: "beta"
+  sample_t_mode_consistency: "discrete"
+  sample_dt_mode_consistency: "uniform"
+  sample_target_t_mode: "relative"
+  denoise_timesteps: 10
+  diffusion_timestep_embed_dim: 64
+  diffusion_target_t_embed_dim: 64
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+  obs_encoder:
+    _target_: maniflow.model.vision_2d.timm_obs_encoder.TimmObsEncoder
+    shape_meta: ${shape_meta}
+    model_name: 'resnet18'
+    pretrained: false   # weight download を回避（動作検証用）
+    frozen: false
+    global_pool: ''
+    feature_aggregation: spatial_embedding  # null は r3m 専用; resnet には spatial_embedding が必要
+    position_encording: 'sinusoidal'
+    downsample_ratio: 32
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+    use_group_norm: true
+    share_rgb_model: false
+    imagenet_norm: true
+
+ema:
+  _target_: maniflow.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 32
+  num_workers: 2
+  shuffle: true
+  pin_memory: true
+  persistent_workers: false
+
+val_dataloader:
+  batch_size: 32
+  num_workers: 2
+  shuffle: false
+  pin_memory: true
+  persistent_workers: false
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: false
+  resume: false
+  lr_scheduler: cosine
+  lr_warmup_steps: 10
+  num_epochs: 20
+  gradient_accumulate_every: 1
+  use_ema: true
+  rollout_every: 10
+  checkpoint_every: 5
+  val_every: 5
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: disabled   # wandb off during verification
+  name: ${training.seed}
+  project: flow_policy_robocasa_1task
+  resume: false
+  tags:
+    - ${logging.project}
+
+checkpoint:
+  save_ckpt: true
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 1
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}

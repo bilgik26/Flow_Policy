@@ -1,0 +1,68 @@
+name: robocasa_multitask
+
+shape_meta:
+  obs:
+    image:
+      shape: [3, 224, 224]
+      type: rgb
+      horizon: ${n_obs_steps}
+    agent_pos:
+      shape: [9]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [7]
+
+# List of RoboCasa task names to train/eval on.
+# These must match the directory names downloaded by download_robocasa_dataset.sh.
+task_names:
+  - CloseBlenderLid
+  - CloseFridge
+  - OpenCabinet
+  - OpenDrawer
+  - OpenStandMixerHead
+  - PickPlaceCounterToCabinet
+  - PickPlaceCounterToStove
+  - PickPlaceDrawerToCounter
+  - PickPlaceSinkToCounter
+  - PickPlaceToasterToCounter
+
+# Base path to downloaded LeRobot datasets
+# Override via hydra: task.dataset_base_path=/path/to/datasets
+dataset_base_path: /home/bilgehan.sakai/Flow_Policy/robocasa/datasets/v1.0/pretrain/atomic
+
+dataset:
+  _target_: maniflow.dataset.robocasa_dataset.RoboCasaImageDataset
+  dataset_dirs:
+    - ${task.dataset_base_path}/CloseBlenderLid
+    - ${task.dataset_base_path}/CloseFridge
+    - ${task.dataset_base_path}/OpenCabinet
+    - ${task.dataset_base_path}/OpenDrawer
+    - ${task.dataset_base_path}/OpenStandMixerHead
+    - ${task.dataset_base_path}/PickPlaceCounterToCabinet
+    - ${task.dataset_base_path}/PickPlaceCounterToStove
+    - ${task.dataset_base_path}/PickPlaceDrawerToCounter
+    - ${task.dataset_base_path}/PickPlaceSinkToCounter
+    - ${task.dataset_base_path}/PickPlaceToasterToCounter
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: ${training.seed}
+  val_ratio: 0.02
+  camera_name: robot0_agentview_left
+  image_size: 224
+  task_name: ${name}
+
+env_runner:
+  _target_: maniflow.env_runner.robocasa_runner.RoboCasaRunner
+  task_name: PickPlaceCounterToCabinet  # primary eval task
+  eval_episodes: 20
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  num_open_loop_steps: 16
+  camera_name: robot0_agentview_left
+  image_size: 224
+  obj_instance_split: target
+  max_episode_steps: null
+  fps: 20
+  tqdm_interval_sec: 1.0
