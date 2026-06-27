@@ -30,8 +30,15 @@ policy:
   language_conditioned: false
   pre_norm_modality: false
 
+  use_consistency: true
   flow_batch_ratio: 0.75
   consistency_batch_ratio: 0.25
+
+  use_sra: false
+  sra_block_out_s: 4
+  sra_block_out_t: 8
+  sra_t_max: 0.2
+  sra_loss_weight: 1.0
 
   sample_t_mode_flow: "beta"
   sample_t_mode_consistency: "discrete"

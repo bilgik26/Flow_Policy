@@ -368,12 +368,13 @@ class DiTX(nn.Module):
         return optimizer
 
 
-    def forward(self, 
-            sample: torch.Tensor, 
-            timestep: Union[torch.Tensor, float, int], 
-            target_t: Union[torch.Tensor, float, int], 
+    def forward(self,
+            sample: torch.Tensor,
+            timestep: Union[torch.Tensor, float, int],
+            target_t: Union[torch.Tensor, float, int],
             vis_cond: torch.Tensor,
             lang_cond: Union[torch.Tensor, list, str] = None,
+            return_block_output: int = None,
             **kwargs):
         """
         Forward pass of the DiTX model.
@@ -381,11 +382,12 @@ class DiTX(nn.Module):
             x: (B,T,input_dim)
             timestep: (B,) or int, maniflow time step t
             target_t: (B,) or float, the target absolute or relative time for the consistency flow training process
-            vis_cond: (B,T, vis_cond_dim) 
+            vis_cond: (B,T, vis_cond_dim)
             lang_cond: (B,) or list of strings, language condition input
+            return_block_output: if set, also return the hidden state after this block index
             **kwargs: additional arguments
-        output: 
-            action: (B,T,output_dim)
+        output:
+            action: (B,T,output_dim)  or  (action, intermediate) when return_block_output is set
         """
 
         # process input
@@ -437,16 +439,20 @@ class DiTX(nn.Module):
 
 
         # 5. transformer blocks
-        for block in self.blocks:
-            x = block(x, time_c, context_c) # (B, T, n_emb)
-
+        intermediate = None
+        for i, block in enumerate(self.blocks):
+            x = block(x, time_c, context_c)  # (B, T, n_emb)
+            if return_block_output is not None and i == return_block_output:
+                intermediate = x
 
         # 6. head
         x = self.final_layer(x)
-       
+
         # (B, T, output_dim)
-        x = x[:, -self.horizon:] # (B, T, out_channels)
-        
+        x = x[:, -self.horizon:]  # (B, T, out_channels)
+
+        if return_block_output is not None:
+            return x, intermediate
         return x
 
 if __name__ == "__main__":

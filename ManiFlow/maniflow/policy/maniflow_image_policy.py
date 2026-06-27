@@ -32,13 +32,20 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             obs_encoder: TimmObsEncoder = None,
             language_conditioned=False,
             # consistency flow training parameters
+            use_consistency=True,
             flow_batch_ratio=0.75,
             consistency_batch_ratio=0.25,
             denoise_timesteps=10,
-            sample_t_mode_flow="beta", 
+            sample_t_mode_flow="beta",
             sample_t_mode_consistency="discrete",
-            sample_dt_mode_consistency="uniform", 
+            sample_dt_mode_consistency="uniform",
             sample_target_t_mode="relative", # relative, absolute
+            # SRA (Self-Representation Alignment) parameters
+            use_sra=False,
+            sra_block_out_s=4,
+            sra_block_out_t=8,
+            sra_t_max=0.2,
+            sra_loss_weight=1.0,
             **kwargs):
         super().__init__()
 
@@ -97,21 +104,29 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         self.kwargs = kwargs
 
         self.num_inference_steps = num_inference_steps
+        self.use_consistency = use_consistency
         self.flow_batch_ratio = flow_batch_ratio
         self.consistency_batch_ratio = consistency_batch_ratio
-        assert flow_batch_ratio + consistency_batch_ratio == 1.0, "Sum of batch ratios should be equal to 1.0"
+        if use_consistency:
+            assert flow_batch_ratio + consistency_batch_ratio == 1.0, "Sum of batch ratios should be equal to 1.0"
         self.denoise_timesteps = denoise_timesteps
         self.sample_t_mode_flow = sample_t_mode_flow
         self.sample_t_mode_consistency = sample_t_mode_consistency
         self.sample_dt_mode_consistency = sample_dt_mode_consistency
         self.sample_target_t_mode = sample_target_t_mode
         assert self.sample_target_t_mode in ["absolute", "relative"], "sample_target_t_mode must be either 'absolute' or 'relative'"
+        self.use_sra = use_sra
+        self.sra_block_out_s = sra_block_out_s
+        self.sra_block_out_t = sra_block_out_t
+        self.sra_t_max = sra_t_max
+        self.sra_loss_weight = sra_loss_weight
         
         cprint(f"[ManiFlowTransformerImagePolicy] Initialized with parameters:", "yellow")
         cprint(f"  - horizon: {self.horizon}", "yellow")
         cprint(f"  - n_action_steps: {self.n_action_steps}", "yellow")
         cprint(f"  - n_obs_steps: {self.n_obs_steps}", "yellow")
         cprint(f"  - num_inference_steps: {self.num_inference_steps}", "yellow")
+        cprint(f"  - use_consistency: {self.use_consistency}", "yellow")
         cprint(f"  - flow_batch_ratio: {self.flow_batch_ratio}", "yellow")
         cprint(f"  - consistency_batch_ratio: {self.consistency_batch_ratio}", "yellow")
         cprint(f"  - denoise_timesteps: {self.denoise_timesteps}", "yellow")
@@ -119,6 +134,12 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         cprint(f"  - sample_t_mode_consistency: {self.sample_t_mode_consistency}", "yellow")
         cprint(f"  - sample_dt_mode_consistency: {self.sample_dt_mode_consistency}", "yellow")
         cprint(f"  - sample_target_t_mode: {self.sample_target_t_mode}", "yellow")
+        cprint(f"  - use_sra: {self.use_sra}", "yellow")
+        if self.use_sra:
+            cprint(f"  - sra_block_out_s: {self.sra_block_out_s}", "yellow")
+            cprint(f"  - sra_block_out_t: {self.sra_block_out_t}", "yellow")
+            cprint(f"  - sra_t_max: {self.sra_t_max}", "yellow")
+            cprint(f"  - sra_loss_weight: {self.sra_loss_weight}", "yellow")
 
         print_params(self)
         
@@ -346,6 +367,8 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         target_dict['t'] = t_flow
         target_dict['target_t'] = target_t_flow
         target_dict['v_target'] = v_t_flow
+        target_dict['x_0'] = x_0_flow
+        target_dict['x_1'] = x_1_flow
         target_dict['vis_cond'] = vis_cond
         target_dict['lang_cond'] = lang_cond
 
@@ -470,62 +493,111 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         vis_cond = nobs_features.reshape(batch_size, -1, self.obs_feature_dim)
         
         """Get flow and consistency targets"""
-        flow_batchsize = int(batch_size * self.flow_batch_ratio)
-        consistency_batchsize = int(batch_size * self.consistency_batch_ratio)
-    
+        if self.use_consistency:
+            flow_batchsize = int(batch_size * self.flow_batch_ratio)
+            consistency_batchsize = int(batch_size * self.consistency_batch_ratio)
+        else:
+            flow_batchsize = batch_size
+            consistency_batchsize = 0
 
         # Get flow targets
-        flow_target_dict = self.get_flow_velocity(nactions[:flow_batchsize], 
+        flow_target_dict = self.get_flow_velocity(nactions[:flow_batchsize],
                                                     vis_cond=vis_cond[:flow_batchsize],
                                                     lang_cond=lang_cond[:flow_batchsize] if lang_cond is not None else None)
-        v_flow_pred = self.model(
-            sample=flow_target_dict['x_t'], 
-            timestep=flow_target_dict['t'].squeeze(),
-            target_t=flow_target_dict['target_t'].squeeze(),
-            vis_cond=vis_cond[:flow_batchsize],
-            lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None)
-        v_flow_pred_magnitude = torch.sqrt(torch.mean(v_flow_pred ** 2)).item()
 
-        # Get consistency targets
-        consistency_target_dict = self.get_consistency_velocity(nactions[flow_batchsize:flow_batchsize+consistency_batchsize],
-                                                                        vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
-                                                                        lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
-                                                                        ema_model=ema_model
-                                                                        )
-        v_ct_pred = self.model(
-            sample=consistency_target_dict['x_t'], 
-            timestep=consistency_target_dict['t'].squeeze(),
-            target_t=consistency_target_dict['target_t'].squeeze(),
-            vis_cond=vis_cond[flow_batchsize:flow_batchsize+consistency_batchsize],
-            lang_cond=lang_cond[flow_batchsize:flow_batchsize+consistency_batchsize] if lang_cond is not None else None,
+        # Student forward pass — also returns intermediate block output when SRA is enabled
+        if self.use_sra:
+            v_flow_pred, student_repr = self.model(
+                sample=flow_target_dict['x_t'],
+                timestep=flow_target_dict['t'].squeeze(),
+                target_t=flow_target_dict['target_t'].squeeze(),
+                vis_cond=vis_cond[:flow_batchsize],
+                lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
+                return_block_output=self.sra_block_out_s,
             )
-        v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
+        else:
+            v_flow_pred = self.model(
+                sample=flow_target_dict['x_t'],
+                timestep=flow_target_dict['t'].squeeze(),
+                target_t=flow_target_dict['target_t'].squeeze(),
+                vis_cond=vis_cond[:flow_batchsize],
+                lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
+            )
+        v_flow_pred_magnitude = torch.sqrt(torch.mean(v_flow_pred ** 2)).item()
 
         """Compute losses"""
         loss = 0.
 
-        # compute flow loss 
+        # compute flow loss
         v_flow_target = flow_target_dict['v_target']
         loss_flow = F.mse_loss(v_flow_pred, v_flow_target, reduction='none')
         loss_flow = reduce(loss_flow, 'b ... -> b (...)', 'mean')
         loss += loss_flow.mean()
         loss_flow = loss_flow.mean().item()
 
-        # compute consistency training loss
-        v_ct_target = consistency_target_dict['v_target']
-        loss_ct = F.mse_loss(v_ct_pred, v_ct_target, reduction='none')
-        loss_ct = reduce(loss_ct, 'b ... -> b (...)', 'mean')
-        loss += loss_ct.mean()
-        loss_ct = loss_ct.mean().item()  
+        # SRA loss: align student's early-block repr (high noise) with
+        # teacher EMA's later-block repr (low noise, larger t in maniflow)
+        if self.use_sra:
+            assert ema_model is not None, "ema_model is required for SRA training"
+            t_student = flow_target_dict['t'].squeeze()  # (B,)
+            delta_t_sra = self.sra_t_max * torch.rand_like(t_student)
+            t_teacher = (t_student + delta_t_sra).clamp(max=1.0)
+            x_t_teacher = self.linear_interpolate(
+                flow_target_dict['x_0'],
+                flow_target_dict['x_1'],
+                t_teacher.view(-1, 1, 1),
+            )
+            target_t_teacher = torch.zeros_like(t_teacher)  # instantaneous velocity
+            with torch.no_grad():
+                _, teacher_repr = ema_model.model(
+                    sample=x_t_teacher,
+                    timestep=t_teacher,
+                    target_t=target_t_teacher,
+                    vis_cond=vis_cond[:flow_batchsize],
+                    lang_cond=lang_cond[:flow_batchsize] if lang_cond is not None else None,
+                    return_block_output=self.sra_block_out_t,
+                )
+            loss_sra = F.smooth_l1_loss(student_repr, teacher_repr, beta=0.05)
+            loss += loss_sra * self.sra_loss_weight
+            loss_sra = loss_sra.item()
+        else:
+            loss_sra = 0.0
+
+        if self.use_consistency:
+            # Get consistency targets
+            consistency_target_dict = self.get_consistency_velocity(
+                nactions[flow_batchsize:flow_batchsize + consistency_batchsize],
+                vis_cond=vis_cond[flow_batchsize:flow_batchsize + consistency_batchsize],
+                lang_cond=lang_cond[flow_batchsize:flow_batchsize + consistency_batchsize] if lang_cond is not None else None,
+                ema_model=ema_model,
+            )
+            v_ct_pred = self.model(
+                sample=consistency_target_dict['x_t'],
+                timestep=consistency_target_dict['t'].squeeze(),
+                target_t=consistency_target_dict['target_t'].squeeze(),
+                vis_cond=vis_cond[flow_batchsize:flow_batchsize + consistency_batchsize],
+                lang_cond=lang_cond[flow_batchsize:flow_batchsize + consistency_batchsize] if lang_cond is not None else None,
+            )
+            v_ct_pred_magnitude = torch.sqrt(torch.mean(v_ct_pred ** 2)).item()
+
+            # compute consistency training loss
+            v_ct_target = consistency_target_dict['v_target']
+            loss_ct = F.mse_loss(v_ct_pred, v_ct_target, reduction='none')
+            loss_ct = reduce(loss_ct, 'b ... -> b (...)', 'mean')
+            loss += loss_ct.mean()
+            loss_ct = loss_ct.mean().item()
+        else:
+            loss_ct = 0.0
+            v_ct_pred_magnitude = 0.0
 
         loss = loss.mean()
         loss_dict = {
                 'loss_flow': loss_flow,
                 'loss_ct': loss_ct,
+                'loss_sra': loss_sra,
                 'v_flow_pred_magnitude': v_flow_pred_magnitude,
                 'v_ct_pred_magnitude': v_ct_pred_magnitude,
                 'bc_loss': loss.item(),
         }
-        
 
         return loss, loss_dict
