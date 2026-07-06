@@ -25,7 +25,7 @@ def main(cfg):
     )
 
     workspace = TrainManiFlowRoboCasaWorkspace(cfg)
-    workspace.eval(mode=cfg.get("eval_mode", "best"))
+    workspace.eval(mode=cfg.get("eval_mode", "best"), eval_dir_tag=cfg.get("eval_dir_tag", ""))
 
 
 if __name__ == "__main__":

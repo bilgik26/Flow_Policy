@@ -314,7 +314,7 @@ class TrainManiFlowRoboCasaWorkspace:
 
     # ── Evaluation only ─────────────────────────────────────────────────────
 
-    def eval(self, mode: str = "best"):
+    def eval(self, mode: str = "best", eval_dir_tag: str = ""):
         cfg = copy.deepcopy(self.cfg)
         ckpt = self.get_checkpoint_path(
             tag=mode, monitor_key=cfg.checkpoint.topk.monitor_key
@@ -332,13 +332,16 @@ class TrainManiFlowRoboCasaWorkspace:
 
         for n_steps in cfg.get("eval_inference_steps", [10]):
             policy.num_inference_steps = n_steps
-            runner_log = env_runner.run(policy)
 
+            subdir = f"steps{n_steps}" + (f"_{eval_dir_tag}" if eval_dir_tag else "")
             eval_dir = os.path.join(
                 self.output_dir,
-                f"eval_results/{self.epoch}/steps{n_steps}",
+                f"eval_results/{self.epoch}/{subdir}",
             )
             os.makedirs(eval_dir, exist_ok=True)
+            video_dir = os.path.join(eval_dir, "videos")
+
+            runner_log = env_runner.run(policy, video_dir=video_dir)
 
             metrics = {k: v for k, v in runner_log.items() if isinstance(v, (int, float))}
             with open(os.path.join(eval_dir, f"metrics_{mode}.json"), "w") as f:

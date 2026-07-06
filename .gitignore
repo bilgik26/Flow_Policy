@@ -56,3 +56,5 @@ output/
 aloha_maniskill_sim/
 /scripts/random_test/
 checkpoints/
+
+.env

@@ -9,48 +9,76 @@ exp_name: "robocasa_1task"
 horizon: 34
 n_obs_steps: 2
 n_action_steps: 32
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
 obs_as_global_cond: true
+
+eval_inference_steps: [10]
 
 policy:
   _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
   block_type: "DiTX"
-  n_layer: 6
-  n_head: 4
-  n_emb: 256
-  visual_cond_len: 256
-  max_lang_cond_len: 256
+  n_layer: 12
+  n_head: 8
+  n_emb: 768
+  visual_cond_len: 1024
+  max_lang_cond_len: 1024
   qkv_bias: false
   qk_norm: false
+
   language_conditioned: false
   pre_norm_modality: false
+
+  use_consistency: true
   flow_batch_ratio: 0.75
   consistency_batch_ratio: 0.25
+
+  use_sra: false
+  sra_block_out_s: 4
+  sra_block_out_t: 8
+  sra_t_max: 0.2
+  sra_loss_weight: 1.0
+
   sample_t_mode_flow: "beta"
   sample_t_mode_consistency: "discrete"
   sample_dt_mode_consistency: "uniform"
   sample_target_t_mode: "relative"
   denoise_timesteps: 10
-  diffusion_timestep_embed_dim: 64
-  diffusion_target_t_embed_dim: 64
+
+  diffusion_timestep_embed_dim: 128
+  diffusion_target_t_embed_dim: 128
+
   horizon: ${horizon}
   n_action_steps: ${n_action_steps}
   n_obs_steps: ${n_obs_steps}
+
   num_inference_steps: 10
   obs_as_global_cond: true
   shape_meta: ${shape_meta}
+
   obs_encoder:
     _target_: maniflow.model.vision_2d.timm_obs_encoder.TimmObsEncoder
     shape_meta: ${shape_meta}
-    model_name: 'resnet18'
-    pretrained: false   # weight download を回避（動作検証用）
+    model_name: 'r3m'
+    pretrained: false
     frozen: false
     global_pool: ''
-    feature_aggregation: spatial_embedding  # null は r3m 専用; resnet には spatial_embedding が必要
+    feature_aggregation: spatial_embedding
     position_encording: 'sinusoidal'
     downsample_ratio: 32
     transforms:
       - type: RandomCrop
         ratio: 0.95
+      - _target_: torchvision.transforms.RandomRotation
+        degrees:
+          - -5.0
+          - 5.0
+        expand: false
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
     use_group_norm: true
     share_rgb_model: false
     imagenet_norm: true
@@ -64,18 +92,18 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 32
-  num_workers: 2
+  batch_size: 64
+  num_workers: 4
   shuffle: true
   pin_memory: true
-  persistent_workers: false
+  persistent_workers: true
 
 val_dataloader:
-  batch_size: 32
-  num_workers: 2
+  batch_size: 64
+  num_workers: 4
   shuffle: false
   pin_memory: true
-  persistent_workers: false
+  persistent_workers: true
 
 optimizer:
   _target_: torch.optim.AdamW
@@ -88,15 +116,15 @@ training:
   device: "cuda:0"
   seed: 42
   debug: false
-  resume: false
+  resume: true
   lr_scheduler: cosine
-  lr_warmup_steps: 10
-  num_epochs: 20
+  lr_warmup_steps: 500
+  num_epochs: 501
   gradient_accumulate_every: 1
   use_ema: true
-  rollout_every: 10
-  checkpoint_every: 5
-  val_every: 5
+  rollout_every: 500
+  checkpoint_every: 100
+  val_every: 50
   sample_every: 5
   max_train_steps: null
   max_val_steps: null
@@ -105,10 +133,10 @@ training:
 logging:
   group: ${exp_name}
   id: null
-  mode: disabled   # wandb off during verification
+  mode: online
   name: ${training.seed}
-  project: flow_policy_robocasa_1task
-  resume: false
+  project: flow_policy_robocasa
+  resume: true
   tags:
     - ${logging.project}
 
@@ -117,13 +145,20 @@ checkpoint:
   topk:
     monitor_key: val_loss
     mode: min
-    k: 1
+    k: 3
     format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
   save_last_ckpt: true
   save_last_snapshot: false
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
 
 hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

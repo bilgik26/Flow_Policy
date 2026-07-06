@@ -63,8 +63,8 @@ policy:
 
     # Use ResNet-34 pretrained on ImageNet (no R3M dependency required)
     # Switch to 'r3m' if R3M is installed: model_name: 'r3m'
-    model_name: 'resnet34.a1_in1k'
-    pretrained: true
+    model_name: 'r3m'
+    pretrained: false
     frozen: false
 
     global_pool: ''
@@ -101,15 +101,15 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64
-  num_workers: 4
+  batch_size: 128
+  num_workers: 8
   shuffle: true
   pin_memory: true
   persistent_workers: true
 
 val_dataloader:
-  batch_size: 64
-  num_workers: 4
+  batch_size: 128
+  num_workers: 8
   shuffle: false
   pin_memory: true
   persistent_workers: true
@@ -128,7 +128,7 @@ training:
   resume: true
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 3001
+  num_epochs: 501
   gradient_accumulate_every: 1
   use_ema: true
   rollout_every: 500    # run env rollout every N epochs

@@ -5,6 +5,9 @@ Maintains a sliding window of n_obs_steps observations, calls the policy every
 num_open_loop_steps, and collects success statistics across eval_episodes.
 """
 
+import os
+
+import imageio
 import numpy as np
 import torch
 import tqdm
@@ -90,7 +93,7 @@ class RoboCasaRunner(BaseRunner):
     # ── Public interface ────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def run(self, policy: BasePolicy, save_video: bool = True) -> dict:
+    def run(self, policy: BasePolicy, save_video: bool = True, video_dir: str = None) -> dict:
         from maniflow.env.robocasa import RoboCasaEnv
 
         device = policy.device
@@ -170,6 +173,17 @@ class RoboCasaRunner(BaseRunner):
                     )
                 except Exception:
                     pass  # wandb disabled または moviepy 未インストール時はスキップ
+
+                if video_dir is not None:
+                    os.makedirs(video_dir, exist_ok=True)
+                    video_path = os.path.join(video_dir, f"ep_{ep_idx:03d}.mp4")
+                    try:
+                        with imageio.get_writer(video_path, fps=self.fps, format="mp4") as writer:
+                            for frame in frames:  # frames: list of (H, W, C) uint8
+                                writer.append_data(frame)
+                        cprint(f"  Saved video: {video_path}", "yellow")
+                    except Exception as e:
+                        cprint(f"  [WARNING] Failed to save video {video_path}: {e}", "red")
 
             torch.cuda.empty_cache()
             cprint(

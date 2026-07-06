@@ -1,4 +1,4 @@
-name: robocasa_1task_TurnOffMicrowave
+name: robocasa_1task_PickPlaceCounterToCabinet
 
 shape_meta:
   obs:
@@ -21,7 +21,7 @@ dataset_base_path: /home/bilgehan.sakai/Flow_Policy/robocasa/datasets/v1.0/pretr
 dataset:
   _target_: maniflow.dataset.robocasa_dataset.RoboCasaImageDataset
   dataset_dirs:
-    - ${task.dataset_base_path}/TurnOffMicrowave
+    - ${task.dataset_base_path}/PickPlaceCounterToCabinet
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}
@@ -33,14 +33,14 @@ dataset:
 
 env_runner:
   _target_: maniflow.env_runner.robocasa_runner.RoboCasaRunner
-  task_name: TurnOffMicrowave
-  eval_episodes: 3
+  task_name: PickPlaceCounterToCabinet
+  eval_episodes: 20
   n_obs_steps: ${n_obs_steps}
   n_action_steps: ${n_action_steps}
   num_open_loop_steps: 16
   camera_name: robot0_agentview_left
   image_size: 224
-  obj_instance_split: pretrain   # 学習データと同じ split で動作確認
-  max_episode_steps: 100         # 短縮（動作確認用）
+  obj_instance_split: target
+  max_episode_steps: null
   fps: 20
   tqdm_interval_sec: 1.0

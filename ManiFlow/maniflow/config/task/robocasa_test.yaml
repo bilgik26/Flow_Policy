@@ -14,14 +14,14 @@ shape_meta:
     shape: [7]
 
 task_names:
-  - TurnOffMicrowave
+  - PickPlaceCounterToCabinet
 
 dataset_base_path: /home/bilgehan.sakai/Flow_Policy/robocasa/datasets/v1.0/pretrain/atomic
 
 dataset:
   _target_: maniflow.dataset.robocasa_dataset.RoboCasaImageDataset
   dataset_dirs:
-    - ${task.dataset_base_path}/TurnOffMicrowave
+    - ${task.dataset_base_path}/PickPlaceCounterToCabinet
   horizon: ${horizon}
   pad_before: ${eval:'${n_obs_steps}-1'}
   pad_after: ${eval:'${n_action_steps}-1'}
@@ -33,7 +33,7 @@ dataset:
 
 env_runner:
   _target_: maniflow.env_runner.robocasa_runner.RoboCasaRunner
-  task_name: TurnOffMicrowave
+  task_name: PickPlaceCounterToCabinet
   eval_episodes: 3
   n_obs_steps: ${n_obs_steps}
   n_action_steps: ${n_action_steps}
