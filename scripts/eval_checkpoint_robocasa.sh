@@ -63,7 +63,7 @@ fi
 
 # If not inside Singularity, re-invoke via the container (osmesa requires it)
 if [[ -z "${SINGULARITY_CONTAINER:-}" ]]; then
-    SIF="/mnt/data/bilgehan.sakai/singularity/sif/flow_policy_robocasa.sif"
+    SIF="/home/bilgehan.sakai/singularity/sif/flow_policy_robocasa.sif"
     if [[ ! -f "$SIF" ]]; then
         echo "ERROR: Singularity image not found at $SIF"
         exit 1
@@ -71,7 +71,7 @@ if [[ -z "${SINGULARITY_CONTAINER:-}" ]]; then
     echo "=== Re-invoking inside Singularity container ==="
     exec singularity exec --nv \
         --bind "/home/bilgehan.sakai:/home/bilgehan.sakai" \
-        --bind "/mnt/data/bilgehan.sakai:/mnt/data/bilgehan.sakai" \
+        --bind "/storage/home/bilgehan.sakai:/storage/home/bilgehan.sakai" \
         --env MUJOCO_GL=osmesa \
         --env PYOPENGL_PLATFORM=osmesa \
         --env CUDA_VISIBLE_DEVICES="$GPU" \

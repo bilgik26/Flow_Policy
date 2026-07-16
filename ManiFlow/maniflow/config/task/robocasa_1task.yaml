@@ -40,7 +40,7 @@ env_runner:
   num_open_loop_steps: 16
   camera_name: robot0_agentview_left
   image_size: 224
-  obj_instance_split: target
+  obj_instance_split: pretrain
   max_episode_steps: null
   fps: 20
   tqdm_interval_sec: 1.0

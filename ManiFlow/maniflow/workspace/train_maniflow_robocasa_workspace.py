@@ -222,10 +222,11 @@ class TrainManiFlowRoboCasaWorkspace:
             policy = self.ema_model if cfg.training.use_ema else self.model
             policy.eval()
 
-            # Rollout
+            # Rollout (skip epoch 0: model is untrained, rollout would just waste time)
             if (
                 RUN_ROLLOUT
                 and env_runner is not None
+                and self.epoch > 0
                 and (self.epoch % cfg.training.rollout_every) == 0
             ):
                 runner_log = env_runner.run(policy)
@@ -287,16 +288,19 @@ class TrainManiFlowRoboCasaWorkspace:
                 step_log["test_mean_score"] = -step_log.get("train_loss", 0.0)
 
             # Checkpoint
-            if (self.epoch % cfg.training.checkpoint_every) == 0 and cfg.checkpoint.save_ckpt:
+            if cfg.checkpoint.save_ckpt:
+                # latest.ckpt はホストの突発的な OOM 等で学習が落ちた際に
+                # resume=true で直前の epoch から再開できるよう毎 epoch 上書き保存する
                 if cfg.checkpoint.save_last_ckpt:
                     self.save_checkpoint()
-                metric = {k.replace("/", "_"): v for k, v in step_log.items()}
-                try:
-                    ckpt_path = topk.get_ckpt_path(metric)
-                    if ckpt_path is not None:
-                        self.save_checkpoint(path=ckpt_path)
-                except Exception as e:
-                    cprint(f"Checkpoint error: {e}", "red")
+                if (self.epoch % cfg.training.checkpoint_every) == 0:
+                    metric = {k.replace("/", "_"): v for k, v in step_log.items()}
+                    try:
+                        ckpt_path = topk.get_ckpt_path(metric)
+                        if ckpt_path is not None:
+                            self.save_checkpoint(path=ckpt_path)
+                    except Exception as e:
+                        cprint(f"Checkpoint error: {e}", "red")
 
             policy.train()
             # エポック要約を無条件に出力（wandb 無効時でも NaN 状況を追跡できるように）
@@ -425,6 +429,35 @@ class TrainManiFlowRoboCasaWorkspace:
         path = pathlib.Path(path)
         payload = torch.load(path.open("rb"), pickle_module=dill, map_location="cpu")
         self.load_payload(payload, **kwargs)
+
+        # use_consistency / sample_target_t_mode change sample_ode()'s inference
+        # behavior but are plain python attributes set at construction time, not
+        # part of the state_dict. If the invocation that loads this checkpoint
+        # (e.g. a later `eval_maniflow_robocasa_workspace` run in the same output
+        # dir) doesn't repeat the exact policy.* overrides used at training time,
+        # self.model would silently be instantiated with the wrong flag and
+        # sample_ode would query the model out of its training distribution.
+        # Restore these from the checkpoint's own recorded training cfg so eval
+        # always matches how the model was actually trained.
+        ckpt_cfg = payload.get("cfg", None)
+        if ckpt_cfg is not None:
+            for attr in ("use_consistency", "sample_target_t_mode"):
+                trained_value = ckpt_cfg.policy.get(attr, None)
+                if trained_value is None:
+                    continue
+                for model_attr in ("model", "ema_model"):
+                    policy = getattr(self, model_attr, None)
+                    if policy is None:
+                        continue
+                    current_value = getattr(policy, attr, None)
+                    if current_value != trained_value:
+                        cprint(
+                            f"[load_checkpoint] {model_attr}.{attr}: overriding "
+                            f"{current_value} -> {trained_value} (from checkpoint's training cfg)",
+                            "yellow",
+                        )
+                    setattr(policy, attr, trained_value)
+
         return payload
 
 

@@ -2,7 +2,10 @@
 
 > **対象:** `Flow_Policy` リポジトリで RoboCasa (bilgik26/robocasa v1.0.1) を使って  
 > Flow Matching Policy の学習と評価を行うための完全手順書。  
-> 環境構築は **Singularity + uv** で行い、conda は使用しない。
+> 環境構築は **Singularity(Apptainer) + uv** で行い、conda は使用しない。
+>
+> **本ドキュメントは `p-team-3` サーバー向けに修正済み（2026-07-08 に Step 1〜3 および 3-4 のKitchenアセット取得まで実機で動作確認済み）。**
+> 元は別サーバーでの構築メモのため、GPU 種別・fakeroot 要否・render グループ権限・一部パスなどこのサーバー向けに修正した箇所がある。
 
 ---
 
@@ -10,22 +13,28 @@
 
 | 項目 | 要件 |
 |---|---|
-| GPU | NVIDIA GPU (A100 推奨) + CUDA 12.8 ドライバ |
-| Singularity | 3.x 以上 |
-| ディスク空き容量 | 10 タスクで約 30 GB（全 65 タスクで 100 GB 超） |
+| GPU | NVIDIA GPU + CUDA 12.8 系ドライバ。本サーバーは **RTX A6000 ×3**（ドライバは CUDA 13.0 対応版）で、cu128 ホイールは前方互換のため問題なく動作する |
+| Singularity | 3.x 以上。**本サーバーの実体は Apptainer 1.4.3**（`singularity` コマンドはラッパー） |
+| fakeroot | 非 root ユーザーでイメージビルドするため `/etc/subuid` / `/etc/subgid` に自ユーザーのマッピングが必要。本サーバーは設定済みなので `singularity build --fakeroot` を使う（Step 1 参照） |
+| render グループ | `/dev/dri/renderD*` への読み書き権限（`render` グループ所属）が必要。本サーバーはこのグループに未所属のため、EGL ハードウェアレンダリングは使えず常に osmesa ソフトウェアレンダリングを使用する（Step 5 参照） |
+| ディスク空き容量 | 学習データ 10 タスクで約 30 GB（全 65 タスクで 100 GB 超）。加えて Kitchen アセット自体も展開後で **約 23 GB**（ダウンロードスクリプトは「~10GB」と表示するが、解凍後の実容量はこれより大きい） |
 | HuggingFace | アカウント不要（RoboCasa データセットは公開済み） |
 
 ---
 
 ## Step 1: Singularity イメージのビルド
 
+> **本サーバー向けの変更点:** 非 root ユーザーでのビルドとなるため `--fakeroot` を付与する。
+> `/etc/subuid` / `/etc/subgid` に自ユーザーのマッピングが存在することを事前に確認しておく
+> （`grep $(whoami) /etc/subuid /etc/subgid` で自分の行が出れば OK）。
+
 ```bash
-export CODEBASE_DIR="/mnt/data/bilgehan.sakai"
+export CODEBASE_DIR="/home/bilgehan.sakai"
 export SINGULARITY_TMPDIR="$CODEBASE_DIR/singularity/tmp_build"
 export SINGULARITY_CACHEDIR="$CODEBASE_DIR/singularity/singularity_cache"
 mkdir -p "$SINGULARITY_TMPDIR" "$SINGULARITY_CACHEDIR"
 
-singularity build \
+singularity build --fakeroot \
     "$CODEBASE_DIR/singularity/sif/flow_policy_robocasa.sif" \
     "$CODEBASE_DIR/singularity/flow_policy_robocasa.def"
 ```
@@ -39,15 +48,15 @@ singularity build \
 Singularity コンテナ内で `uv` を使い、`Flow_Policy` ディレクトリに `.venv` を作成する。
 
 ```bash
-export CODEBASE_DIR="/mnt/data/bilgehan.sakai"
+export CODEBASE_DIR="/home/bilgehan.sakai"
 SIF="$CODEBASE_DIR/singularity/sif/flow_policy_robocasa.sif"
 
 singularity exec --nv \
-    --bind "$CODEBASE_DIR:/mnt/data/bilgehan.sakai" \
+    --bind "$CODEBASE_DIR:/home/bilgehan.sakai" \
     --bind "$HOME/.cache:/root/.cache" \
     "$SIF" \
     bash -c "
-        cd /mnt/data/bilgehan.sakai/Flow_Policy
+        cd /home/bilgehan.sakai/Flow_Policy
         uv sync --extra cu128 --python 3.10
     "
 ```
@@ -71,22 +80,22 @@ singularity exec --nv \
 ### 3-1. リポジトリのクローン（ホスト上）
 
 ```bash
-cd /mnt/data/bilgehan.sakai/Flow_Policy
+cd /home/bilgehan.sakai/Flow_Policy
 git clone -b dev https://github.com/bilgik26/robocasa.git robocasa
 ```
 
 ### 3-2. コンテナ内で依存パッケージをインストール
 
 ```bash
-export CODEBASE_DIR="/mnt/data/bilgehan.sakai"
+export CODEBASE_DIR="/home/bilgehan.sakai"
 SIF="$CODEBASE_DIR/singularity/sif/flow_policy_robocasa.sif"
 
 singularity exec --nv \
-    --bind "$CODEBASE_DIR:/mnt/data/bilgehan.sakai" \
+    --bind "$CODEBASE_DIR:/home/bilgehan.sakai" \
     --bind "$HOME/.cache:/root/.cache" \
     "$SIF" \
     bash -c "
-        source /mnt/data/bilgehan.sakai/Flow_Policy/.venv/bin/activate
+        source /home/bilgehan.sakai/Flow_Policy/.venv/bin/activate
 
         # robosuite を GitHub main 版に差し替え
         # (新 robocasa の kitchen.py が load_model_on_init を使用しており
@@ -94,7 +103,7 @@ singularity exec --nv \
         uv pip install 'robosuite @ git+https://github.com/ARISE-Initiative/robosuite.git'
 
         # 新 robocasa をインストール (editable)
-        uv pip install -e /mnt/data/bilgehan.sakai/Flow_Policy/robocasa
+        uv pip install -e /home/bilgehan.sakai/Flow_Policy/robocasa
 
         # numba を安定バージョンに固定
         # (新 robocasa の setup.py が numba==0.61.2 を要求するが
@@ -102,7 +111,7 @@ singularity exec --nv \
         uv pip install 'numba==0.63.1' 'llvmlite==0.46.0'
 
         # Flow_Policy 自身をインストール (editable)
-        uv pip install -e /mnt/data/bilgehan.sakai/Flow_Policy/ManiFlow
+        uv pip install -e /home/bilgehan.sakai/Flow_Policy/ManiFlow
     "
 ```
 
@@ -114,30 +123,35 @@ singularity exec --nv \
 
 ```bash
 sed -i 's/sys.meta_path.append(_EditableFinder)/sys.meta_path.insert(0, _EditableFinder)/' \
-    /mnt/data/bilgehan.sakai/Flow_Policy/.venv/lib/python3.10/site-packages/__editable___robocasa_1_0_1_finder.py
+    /home/bilgehan.sakai/Flow_Policy/.venv/lib/python3.10/site-packages/__editable___robocasa_1_0_1_finder.py
 ```
 
-#### パッチ 2: NumPy バージョンアサーション修正
+#### パッチ 2: NumPy バージョンアサーション修正（本サーバーでは不要だった）
 
-**問題:** `robocasa/__init__.py` が `numpy.__version__ in ["2.2.5"]` とアサートするが、インストールされる NumPy は 2.2.6。
+**問題:** `robocasa/__init__.py` が `numpy.__version__ in ["2.2.5"]` とアサートするが、環境によっては解決される NumPy が 2.2.6 になり失敗する。
+
+**本サーバーでの実績:** `uv pip install -e robocasa/` 後に解決された NumPy はちょうど `2.2.5` だったため、このパッチは不要だった（Step 3-5 の動作確認で `AssertionError` は発生しなかった）。
+`uv.lock` の解決結果次第で 2.2.6 になるケースもあり得るため、`AssertionError: numpy version must be 2.2.5` が出た場合のみ以下を適用する（トラブルシューティング参照）。
 
 ```bash
 sed -i 's/    "2\.2\.5",/    "2.2.5",\n    "2.2.6",/' \
-    /mnt/data/bilgehan.sakai/Flow_Policy/robocasa/robocasa/__init__.py
+    /home/bilgehan.sakai/Flow_Policy/robocasa/robocasa/__init__.py
 ```
 
 ### 3-4. Kitchen アセットのダウンロード
 
 ```bash
 singularity exec --nv \
-    --bind "$CODEBASE_DIR:/mnt/data/bilgehan.sakai" \
+    --bind "$CODEBASE_DIR:/home/bilgehan.sakai" \
     --bind "$HOME/.cache:/root/.cache" \
     "$SIF" \
     bash -c "
-        source /mnt/data/bilgehan.sakai/Flow_Policy/.venv/bin/activate
-        cd /mnt/data/bilgehan.sakai/Flow_Policy
+        source /home/bilgehan.sakai/Flow_Policy/.venv/bin/activate
+        cd /home/bilgehan.sakai/Flow_Policy
 
-        # Kitchen アセット (約 3.8GB、初回のみ)
+        # Kitchen アセット（初回のみ。スクリプト表示は「~10GB ダウンロード」だが
+        # textures / generative_textures / fixtures / objaverse / aigen_objs / lightwheel の
+        # 各 zip を展開後の実容量は約 23GB になる）
         echo 'y' | python robocasa/robocasa/scripts/download_kitchen_assets.py
 
         # プライベートマクロファイルのセットアップ
@@ -147,14 +161,18 @@ singularity exec --nv \
 
 ### 3-5. 動作確認
 
+> **本サーバー向けの変更点:** `render` グループに未所属のため、`MUJOCO_GL=osmesa` **と** `PYOPENGL_PLATFORM=osmesa` を両方指定する必要がある。
+> 片方だけでは `ImportError: Cannot use OSMesa rendering platform. The PYOPENGL_PLATFORM environment variable is set to 'egl'` で失敗する（コンテナが `PYOPENGL_PLATFORM=egl` をデフォルト設定しているため）。詳細は Step 5 のレンダリングに関する注意点、およびトラブルシューティングを参照。
+
 ```bash
 singularity exec --nv \
-    --bind "$CODEBASE_DIR:/mnt/data/bilgehan.sakai" \
+    --bind "$CODEBASE_DIR:/home/bilgehan.sakai" \
     --bind "$HOME/.cache:/root/.cache" \
     --env MUJOCO_GL=osmesa \
+    --env PYOPENGL_PLATFORM=osmesa \
     "$SIF" \
     bash -c "
-        source /mnt/data/bilgehan.sakai/Flow_Policy/.venv/bin/activate
+        source /home/bilgehan.sakai/Flow_Policy/.venv/bin/activate
         python -c '
 import torch, numba, numpy, robosuite, mujoco, robocasa
 print(\"torch:\", torch.__version__, \"cuda:\", torch.cuda.is_available())
@@ -168,16 +186,16 @@ print(\"robocasa path:\", robocasa.__file__)
     "
 ```
 
-期待される出力:
+期待される出力（本サーバーでの実測値。`numpy` はパッチ2の要否に応じて 2.2.5 または 2.2.6 になる）:
 
 ```
 torch: 2.7.0+cu128 cuda: True
 numba: 0.63.1
-numpy: 2.2.6
+numpy: 2.2.5
 robosuite: 1.5.2
 mujoco: 3.3.1
 robocasa: 1.0.1
-robocasa path: /mnt/data/bilgehan.sakai/Flow_Policy/robocasa/robocasa/__init__.py
+robocasa path: /home/bilgehan.sakai/Flow_Policy/robocasa/robocasa/__init__.py
 ```
 
 > **注意:** `robocasa path` の末尾が `robocasa/robocasa/__init__.py` になっていることを確認する。  
@@ -210,11 +228,11 @@ datasets/v1.0/pretrain/atomic/<TaskName>/
 
 ```bash
 singularity exec --nv \
-    --bind "$CODEBASE_DIR:/mnt/data/bilgehan.sakai" \
+    --bind "$CODEBASE_DIR:/home/bilgehan.sakai" \
     --bind "$HOME/.cache:/root/.cache" \
     "$SIF" \
     bash -c "
-        source /mnt/data/bilgehan.sakai/Flow_Policy/.venv/bin/activate
+        source /home/bilgehan.sakai/Flow_Policy/.venv/bin/activate
         for TASK in CloseBlenderLid CloseFridge OpenCabinet OpenDrawer \
                     OpenStandMixerHead PickPlaceCounterToCabinet PickPlaceCounterToStove \
                     PickPlaceDrawerToCounter PickPlaceSinkToCounter PickPlaceToasterToCounter; do
@@ -226,7 +244,7 @@ download_datasets(
     tasks=['\$TASK'],
     source=['human'],
     overwrite=False,
-    output_dir='/mnt/data/bilgehan.sakai/Flow_Policy/data/robocasa/datasets',
+    output_dir='/home/bilgehan.sakai/Flow_Policy/data/robocasa/datasets',
 )
 \"
         done
@@ -262,7 +280,7 @@ task.dataset_base_path=/absolute/path/to/datasets/v1.0/pretrain/atomic
 ```bash
 singularity exec --nv \
     --bind "/home/bilgehan.sakai:/home/bilgehan.sakai" \
-    --bind "$CODEBASE_DIR:/mnt/data/bilgehan.sakai" \
+    --bind "$CODEBASE_DIR:/home/bilgehan.sakai" \
     --env MUJOCO_GL=osmesa \
     --env PYOPENGL_PLATFORM=osmesa \
     --env CUDA_VISIBLE_DEVICES=0 \
@@ -287,13 +305,18 @@ singularity exec --nv \
 > （`CUDA_VISIBLE_DEVICES` に含まれない値を指定すると `AssertionError`）。  
 > **osmesa ソフトウェアレンダリング**（`MUJOCO_GL=osmesa` + `PYOPENGL_PLATFORM=osmesa`）が唯一の解決策。  
 > GPU アクセス権を得るには `sudo usermod -aG render $USER` が必要（サーバー管理者に依頼）。
+>
+> **本サーバーでの確認結果（2026-07-08 時点）:** `id` コマンドの groups に `render` が含まれておらず、
+> `/dev/dri/renderD128〜132` は存在するが `crw-rw----+ root:render` で読み書き不可。
+> よって現状は常に osmesa 一択。GPU 自体（物理シミュレーション・学習推論）は `--nv` 経由で問題なく使用できるため、
+> 学習・評価のスループットには支障はない。
 
 または付属のスクリプトを使用する:
 
 ```bash
 singularity exec --nv \
     --bind "/home/bilgehan.sakai:/home/bilgehan.sakai" \
-    --bind "$CODEBASE_DIR:/mnt/data/bilgehan.sakai" \
+    --bind "$CODEBASE_DIR:/home/bilgehan.sakai" \
     --env MUJOCO_GL=osmesa \
     --env PYOPENGL_PLATFORM=osmesa \
     "$SIF" \
@@ -344,7 +367,7 @@ Flow_Policy/ManiFlow/data/outputs/<DATE>/<TIME>_<exp_name>_robocasa_multitask/
 ```bash
 singularity exec --nv \
     --bind "/home/bilgehan.sakai:/home/bilgehan.sakai" \
-    --bind "$CODEBASE_DIR:/mnt/data/bilgehan.sakai" \
+    --bind "$CODEBASE_DIR:/home/bilgehan.sakai" \
     --env MUJOCO_GL=osmesa \
     --env PYOPENGL_PLATFORM=osmesa \
     --env CUDA_VISIBLE_DEVICES=0 \
@@ -403,19 +426,32 @@ task.env_runner.obj_instance_split=target
 
 ```bash
 sed -i 's/sys.meta_path.append(_EditableFinder)/sys.meta_path.insert(0, _EditableFinder)/' \
-    /mnt/data/bilgehan.sakai/Flow_Policy/.venv/lib/python3.10/site-packages/__editable___robocasa_1_0_1_finder.py
+    /home/bilgehan.sakai/Flow_Policy/.venv/lib/python3.10/site-packages/__editable___robocasa_1_0_1_finder.py
 ```
 
 ---
 
 ### `AssertionError: numpy version must be 2.2.5`
 
-**原因:** `robocasa/__init__.py` の NumPy バージョンアサーション。  
-**修正:** Step 3-3 パッチ 2 を再適用する。
+**原因:** `robocasa/__init__.py` の NumPy バージョンアサーション。依存解決の結果 NumPy が 2.2.6 になった場合にのみ発生する
+（本サーバーでは 2.2.5 ちょうどに解決されるため通常は発生しない。`python -c "import numpy; print(numpy.__version__)"` で確認）。  
+**修正:** Step 3-3 パッチ 2 を適用する。
 
 ```bash
 sed -i 's/    "2\.2\.5",/    "2.2.5",\n    "2.2.6",/' \
-    /mnt/data/bilgehan.sakai/Flow_Policy/robocasa/robocasa/__init__.py
+    /home/bilgehan.sakai/Flow_Policy/robocasa/robocasa/__init__.py
+```
+
+---
+
+### `singularity build` が `Permission denied` / `error creating overlay mount` で失敗する
+
+**原因:** 非 root ユーザーによる Singularity/Apptainer ビルドには fakeroot が必要。
+**修正:** `--fakeroot` フラグを付与する（Step 1 参照）。`/etc/subuid` / `/etc/subgid` に自ユーザーの行が無い場合はサーバー管理者に追加を依頼する。
+
+```bash
+grep $(whoami) /etc/subuid /etc/subgid
+singularity build --fakeroot "$SIF_PATH" "$DEF_PATH"
 ```
 
 ---
@@ -426,7 +462,7 @@ sed -i 's/    "2\.2\.5",/    "2.2.5",\n    "2.2.6",/' \
 **修正:** robosuite を GitHub main 版に差し替える（Step 3-2 参照）。
 
 ```bash
-source /mnt/data/bilgehan.sakai/Flow_Policy/.venv/bin/activate
+source /home/bilgehan.sakai/Flow_Policy/.venv/bin/activate
 uv pip install 'robosuite @ git+https://github.com/ARISE-Initiative/robosuite.git'
 ```
 
@@ -438,7 +474,7 @@ uv pip install 'robosuite @ git+https://github.com/ARISE-Initiative/robosuite.gi
 **修正:** Step 3-2 の numba 固定コマンドを再実行する。
 
 ```bash
-source /mnt/data/bilgehan.sakai/Flow_Policy/.venv/bin/activate
+source /home/bilgehan.sakai/Flow_Policy/.venv/bin/activate
 uv pip install 'numba==0.63.1' 'llvmlite==0.46.0'
 ```
 
@@ -531,6 +567,6 @@ Flow_Policy/
             └── task/
                 └── robocasa_multitask.yaml
 
-/mnt/data/bilgehan.sakai/singularity/
+/home/bilgehan.sakai/singularity/
 └── flow_policy_robocasa.def                # Singularity ビルド定義
 ```

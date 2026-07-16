@@ -61,14 +61,12 @@ policy:
     _target_: maniflow.model.vision_2d.timm_obs_encoder.TimmObsEncoder
     shape_meta: ${shape_meta}
 
-    # Use ResNet-34 pretrained on ImageNet (no R3M dependency required)
-    # Switch to 'r3m' if R3M is installed: model_name: 'r3m'
     model_name: 'r3m'
     pretrained: false
     frozen: false
 
     global_pool: ''
-    feature_aggregation: spatial_embedding
+    feature_aggregation: null
     position_encording: 'sinusoidal'
 
     downsample_ratio: 32

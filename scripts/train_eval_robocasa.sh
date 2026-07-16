@@ -28,13 +28,14 @@ MODE="${4:-train}"            # "train" or "eval"
 USE_CONSISTENCY="${5:-true}"  # "true" or "false"
 USE_SRA="${6:-false}"         # "true" or "false"
 TASK_TYPE="${7:-multitask}"   # "multitask" or "1task"
+EXTRA_ARGS=("${@:8}")         # additional hydra overrides, e.g. horizon=18 n_action_steps=16
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(dirname "$SCRIPT_DIR")"
 
 # If not inside Singularity, re-invoke via the container (osmesa requires it)
 if [[ -z "${SINGULARITY_CONTAINER:-}" ]]; then
-    SIF="/mnt/data/bilgehan.sakai/singularity/sif/flow_policy_robocasa.sif"
+    SIF="/home/bilgehan.sakai/singularity/sif/flow_policy_robocasa.sif"
     if [[ ! -f "$SIF" ]]; then
         echo "ERROR: Singularity image not found at $SIF"
         exit 1
@@ -42,7 +43,6 @@ if [[ -z "${SINGULARITY_CONTAINER:-}" ]]; then
     echo "=== Re-invoking inside Singularity container ==="
     exec singularity exec --nv \
         --bind "/home/bilgehan.sakai:/home/bilgehan.sakai" \
-        --bind "/mnt/data/bilgehan.sakai:/mnt/data/bilgehan.sakai" \
         --env MUJOCO_GL=osmesa \
         --env PYOPENGL_PLATFORM=osmesa \
         --env CUDA_VISIBLE_DEVICES="$GPU" \
@@ -70,7 +70,7 @@ export PYTHONPATH="$WORKSPACE/robocasa:${PYTHONPATH:-}"
 
 cd "$WORKSPACE/ManiFlow"
 
-RUN_DIR="$WORKSPACE/ManiFlow/data/outputs/$(date +%Y.%m.%d)/$(date +%H.%M.%S)_${EXP_NAME}_seed${SEED}"
+RUN_DIR="${RUN_DIR:-$WORKSPACE/ManiFlow/data/outputs/$(date +%Y.%m.%d)/$(date +%H.%M.%S)_${EXP_NAME}_seed${SEED}}"
 
 if [[ "$TASK_TYPE" == "1task" ]]; then
     CONFIG_NAME="maniflow_image_timm_policy_robocasa_1task"
@@ -88,7 +88,8 @@ if [[ "$MODE" == "eval" ]]; then
         training.seed="$SEED" \
         training.device="cuda:0" \
         exp_name="$EXP_NAME" \
-        "hydra.run.dir=$RUN_DIR"
+        "hydra.run.dir=$RUN_DIR" \
+        "${EXTRA_ARGS[@]}"
 else
     echo "=== Training mode (task_type=${TASK_TYPE}, use_consistency=${USE_CONSISTENCY}, use_sra=${USE_SRA}) ==="
     python -m maniflow.workspace.train_maniflow_robocasa_workspace \
@@ -99,5 +100,6 @@ else
         exp_name="$EXP_NAME" \
         policy.use_consistency="$USE_CONSISTENCY" \
         policy.use_sra="$USE_SRA" \
-        "hydra.run.dir=$RUN_DIR"
+        "hydra.run.dir=$RUN_DIR" \
+        "${EXTRA_ARGS[@]}"
 fi

@@ -342,11 +342,15 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         device = actions.device
         
         # sample t and dt for flow
-        # dt is zero for flow, as we aim to predict the instantaneous velocity at t
+        # dt is zero for flow, as we aim to predict the instantaneous velocity at t.
+        # (Only the consistency branch teaches the model non-zero target_t/jump-size
+        # values; when use_consistency=False, target_t is held at 0 during both
+        # training and inference, i.e. it carries no information, matching plain
+        # flow matching where v_theta only depends on (x_t, t).)
         t_flow = self.sample_t(flow_batchsize, mode=self.sample_t_mode_flow).to(device)
         t_flow = t_flow.view(-1, 1, 1)
         dt_flow = torch.zeros((flow_batchsize,), device=device)
-        
+
         # get target timestep
         # target_t_flow is the target timestep for the flow step
         # it can be either absolute or relative to t_flow
@@ -455,7 +459,14 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
 
         for i in range(N):
             ti = torch.ones((batchsize,), device=self.device) * t[i]
-            if self.sample_target_t_mode == "absolute":
+            if not self.use_consistency:
+                # Plain flow matching: dt_flow was held at 0 throughout training
+                # (see get_flow_velocity), so query the model the same way here -
+                # target_t carries no jump-size information without consistency
+                # training. Gradual denoising instead comes purely from taking N
+                # small Euler steps of size dt along the instantaneous flow.
+                target_t = ti if self.sample_target_t_mode == "absolute" else torch.zeros((batchsize,), device=self.device)
+            elif self.sample_target_t_mode == "absolute":
                 target_t = ti + dt
             elif self.sample_target_t_mode == "relative":
                 target_t = dt

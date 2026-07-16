@@ -13,12 +13,18 @@ Action format accepted by step():
     → LeRobot action[5:12] に相当
 
 The wrapper places the 7-dim EEF action into the correct positions of the
-12-dim HYBRID_MOBILE_BASE action (base locked):
-  [0:4]  base_motion = [0, 0, 0, 0]   (locked)
-  [4:5]  control_mode = [-1]           (locked base mode)
-  [5:8]  EEF delta pos  ← policy action[0:3]
-  [8:11] EEF delta ori  ← policy action[3:6]
-  [11:12] gripper       ← policy action[6]
+12-dim HYBRID_MOBILE_BASE action (base locked). This is the RAW robosuite
+composite-controller action order (confirmed via
+CompositeController.print_action_info() on a live env: right=0:6,
+right_gripper=6:7, base=7:10, torso=10:11, mode=11:12), which is DIFFERENT
+from the "LeRobot reordered" layout used by the offline dataset files
+(see robocasa_dataset.py / docs/investigation_and_verification.md):
+  [0:3]   EEF delta pos  ← policy action[0:3]
+  [3:6]   EEF delta ori  ← policy action[3:6]
+  [6:7]   gripper        ← policy action[6]
+  [7:10]  base_motion = [0, 0, 0]   (locked, JOINT_VELOCITY control_dim=3)
+  [10:11] torso = [0]               (neutral, unused by policy)
+  [11:12] mode = [-1]               (locked base mode)
 
 Controller config: loaded from the bundled robocasa_controller_configs.pkl.
 
@@ -35,13 +41,15 @@ import robosuite
 
 _PKL_PATH = pathlib.Path(__file__).parent / "robocasa_controller_configs.pkl"
 
-# LeRobot action layout: [base(0:4), mode(4:5), eef_pos(5:8), eef_ori(8:11), gripper(11:12)]
+# Raw robosuite HYBRID_MOBILE_BASE action layout (right=0:6, right_gripper=6:7,
+# base=7:10, torso=10:11, mode=11:12), NOT the "LeRobot reordered" layout used
+# by the offline dataset files.
 # 7-dim policy action → 12-dim env action mapping:
-#   env[0:5]  = base locked: [0, 0, 0, 0, -1]
-#   env[5:8]  = policy[0:3]  (EEF delta pos)
-#   env[8:11] = policy[3:6]  (EEF delta ori)
-#   env[11]   = policy[6]    (gripper)
-_N_LOCKED = 5  # base_motion(4) + control_mode(1)
+#   env[0:3]   = policy[0:3]  (EEF delta pos)
+#   env[3:6]   = policy[3:6]  (EEF delta ori)
+#   env[6]     = policy[6]    (gripper)
+#   env[7:11]  = base+torso locked: [0, 0, 0, 0]
+#   env[11]    = -1            (mode: base locked)
 
 # 9-dim agent_pos: first 9 dims of robot0_proprio-state
 # These correspond to joint/gripper/EEF state used by cosmos-policy for normalization.
@@ -121,17 +129,24 @@ class RoboCasaEnv:
         Parameters
         ----------
         action : (7,) float32 — EEF delta_pos(3) + delta_ori(3) + gripper(1)
-            policy action[0:3] → env EEF pos  [5:8]
-            policy action[3:6] → env EEF ori  [8:11]
-            policy action[6]   → env gripper  [11]
-            env base+mode [0:5] は [0,0,0,0,-1] で固定（台車ロック）
+            policy action[0:3] → env EEF pos  [0:3]
+            policy action[3:6] → env EEF ori  [3:6]
+            policy action[6]   → env gripper  [6]
+            env base+torso [7:11] は [0,0,0,0] で固定（台車ロック）
+            env mode [11] は -1 固定（台車ロックモード）
+
+        Note: this is the RAW robosuite HYBRID_MOBILE_BASE action order
+        (right=0:6, right_gripper=6:7, base=7:10, torso=10:11, mode=11:12),
+        confirmed via CompositeController.print_action_info() on a live env.
+        It is NOT the same as the "LeRobot reordered" layout used by the
+        offline dataset files (base first) — do not conflate the two.
         """
         a = action.astype(np.float32)
         full_action = np.zeros(12, dtype=np.float32)
-        full_action[4] = -1.0       # control_mode: base locked
-        full_action[5:8] = a[0:3]   # EEF delta pos
-        full_action[8:11] = a[3:6]  # EEF delta ori
-        full_action[11] = a[6]      # gripper
+        full_action[0:3] = a[0:3]   # EEF delta pos
+        full_action[3:6] = a[3:6]   # EEF delta ori
+        full_action[6] = a[6]       # gripper
+        full_action[11] = -1.0      # mode: base locked
         raw, reward, done, info = self._env.step(full_action)
         obs = self._process_obs(raw)
         success = bool(self._env._check_success())

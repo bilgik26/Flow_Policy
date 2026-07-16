@@ -299,7 +299,9 @@ class TimmObsEncoder(ModuleAttrMixin):
                 img = F.interpolate(img, size=(target_H, target_W), mode='bilinear', align_corners=False)
             
             assert img.shape[1:] == self.key_shape_map[key]
-            img = self.key_transform_map[key](img).to(self.device)
+            if self.training:
+                img = self.key_transform_map[key](img)
+            img = img.to(self.device)
             raw_feature = self.key_model_map[key](img).to(self.device)
             feature = self.aggregate_feature(raw_feature)
             assert len(feature.shape) == 2 and feature.shape[0] == B * T
