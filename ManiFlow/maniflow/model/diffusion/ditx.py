@@ -19,6 +19,26 @@ from termcolor import cprint
 
 logger = logging.getLogger(__name__)
 
+class SRAProjectionHead(nn.Module):
+    """
+    Predictor head applied only to the *student's* aligned representation
+    for the SRA loss (see SRA/DiT-SRA's ``SimpleHead``: Linear -> SiLU ->
+    Linear, hidden_size -> 2*hidden_size -> hidden_size). The teacher (EMA)
+    representation is compared raw, without this head - an asymmetric
+    student-only predictor as in BYOL/SimSiam.
+    """
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.linear1 = nn.Linear(in_dim, in_dim + out_dim)
+        self.linear2 = nn.Linear(in_dim + out_dim, out_dim)
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.linear2(self.act(x))
+        return x
+
+
 class FinalLayer(nn.Module):
     """
     The final layer of DIT-X, adopted from RDT.
@@ -62,12 +82,14 @@ class DiTX(nn.Module):
         pre_norm_modality: bool = False,
         language_conditioned: bool=False,
         language_model: str = "t5-small",
+        use_sra: bool = False,
     ):
         super().__init__()
         self.n_obs_steps = n_obs_steps
         self.visual_cond_len = visual_cond_len
         self.language_conditioned = language_conditioned
         self.pre_norm_modality = pre_norm_modality
+        self.use_sra = use_sra
         
         # constants
         T = horizon
@@ -137,6 +159,13 @@ class DiTX(nn.Module):
         
         # Final Layer
         self.final_layer = FinalLayer(n_emb, output_dim)
+
+        # SRA (Self-Representation Alignment) student-only predictor head,
+        # see SRA/DiT-SRA's SimpleHead. Applied only when apply_sra_head=True
+        # is passed to forward() (i.e. for the student's own forward pass);
+        # the teacher/EMA call omits it and compares the raw block output.
+        if self.use_sra:
+            self.sra_head = SRAProjectionHead(n_emb, n_emb)
 
         self.initialize_weights()
         cprint(f"[DiTX Transformer] Initialized weights for DiTX", "green")
@@ -375,6 +404,7 @@ class DiTX(nn.Module):
             vis_cond: torch.Tensor,
             lang_cond: Union[torch.Tensor, list, str] = None,
             return_block_output: int = None,
+            apply_sra_head: bool = False,
             **kwargs):
         """
         Forward pass of the DiTX model.
@@ -384,7 +414,13 @@ class DiTX(nn.Module):
             target_t: (B,) or float, the target absolute or relative time for the consistency flow training process
             vis_cond: (B,T, vis_cond_dim)
             lang_cond: (B,) or list of strings, language condition input
-            return_block_output: if set, also return the hidden state after this block index
+            return_block_output: if set, also return the hidden state after this many
+                blocks have been processed (1-indexed, matching SRA/DiT-SRA's `ad`
+                convention: return_block_output=4 captures the output after block
+                index 3, i.e. after 4 blocks have run).
+            apply_sra_head: if True (student forward pass), pass the captured
+                intermediate through `self.sra_head` before returning it. Leave
+                False for the teacher/EMA forward pass so it stays un-projected.
             **kwargs: additional arguments
         output:
             action: (B,T,output_dim)  or  (action, intermediate) when return_block_output is set
@@ -442,8 +478,8 @@ class DiTX(nn.Module):
         intermediate = None
         for i, block in enumerate(self.blocks):
             x = block(x, time_c, context_c)  # (B, T, n_emb)
-            if return_block_output is not None and i == return_block_output:
-                intermediate = x
+            if return_block_output is not None and (i + 1) == return_block_output:
+                intermediate = self.sra_head(x) if apply_sra_head and self.use_sra else x
 
         # 6. head
         x = self.final_layer(x)

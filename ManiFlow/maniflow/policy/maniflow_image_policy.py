@@ -46,6 +46,17 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             sra_block_out_t=8,
             sra_t_max=0.2,
             sra_loss_weight=1.0,
+            # SRA/DiT-SRA's train.py always down-weights the align loss
+            # relative to the main loss and decays it further as training
+            # progresses ("we dynamically adjust the weight of align loss to
+            # make two losses at the same scale"). Its constants (base_scale
+            # 0.4, decay starting at epoch 149, decaying over 1000 epochs)
+            # are tuned for its own 801-epoch ImageNet schedule; here they are
+            # expressed as *fractions* of this run's num_epochs so the same
+            # proportions apply regardless of how long training runs.
+            sra_weight_base_scale=0.4,
+            sra_weight_decay_start_frac=149 / 801,
+            sra_weight_decay_span_frac=1000 / 801,
             **kwargs):
         super().__init__()
 
@@ -88,6 +99,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             qk_norm=qk_norm,
             block_type=block_type,
             language_conditioned=language_conditioned,
+            use_sra=use_sra,
         )
         
         self.obs_encoder = obs_encoder
@@ -120,7 +132,10 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         self.sra_block_out_t = sra_block_out_t
         self.sra_t_max = sra_t_max
         self.sra_loss_weight = sra_loss_weight
-        
+        self.sra_weight_base_scale = sra_weight_base_scale
+        self.sra_weight_decay_start_frac = sra_weight_decay_start_frac
+        self.sra_weight_decay_span_frac = sra_weight_decay_span_frac
+
         cprint(f"[ManiFlowTransformerImagePolicy] Initialized with parameters:", "yellow")
         cprint(f"  - horizon: {self.horizon}", "yellow")
         cprint(f"  - n_action_steps: {self.n_action_steps}", "yellow")
@@ -140,9 +155,35 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             cprint(f"  - sra_block_out_t: {self.sra_block_out_t}", "yellow")
             cprint(f"  - sra_t_max: {self.sra_t_max}", "yellow")
             cprint(f"  - sra_loss_weight: {self.sra_loss_weight}", "yellow")
+            cprint(f"  - sra_weight_base_scale: {self.sra_weight_base_scale}", "yellow")
+            cprint(f"  - sra_weight_decay_start_frac: {self.sra_weight_decay_start_frac}", "yellow")
+            cprint(f"  - sra_weight_decay_span_frac: {self.sra_weight_decay_span_frac}", "yellow")
 
         print_params(self)
-        
+
+    def _sra_effective_weight(self, epoch=None, num_epochs=None):
+        """
+        Effective weight applied to the (unweighted) SRA loss this step.
+
+        Mirrors SRA/DiT-SRA's train.py:
+            align_loss_mean = align_loss.mean() * 0.4 * (0.1 ** (
+                ((epoch - 149) / 1000 + 1) if epoch > 149 else 1))
+        i.e. always down-weighted by an initial 10x factor (0.4 * 0.1),
+        decaying by a further 10x every `span` epochs once `epoch` passes
+        `start`. `start`/`span` are given here as fractions of num_epochs so
+        the proportions match regardless of this run's total epoch count.
+
+        Falls back to the flat `sra_loss_weight` (no decay) if epoch/num_epochs
+        aren't provided, e.g. when compute_loss is called from a context that
+        doesn't track training progress.
+        """
+        if epoch is None or num_epochs is None or num_epochs <= 0:
+            return self.sra_loss_weight
+        start = self.sra_weight_decay_start_frac * num_epochs
+        span = self.sra_weight_decay_span_frac * num_epochs
+        exponent = 1.0 if epoch <= start else (epoch - start) / span + 1.0
+        return self.sra_loss_weight * self.sra_weight_base_scale * (0.1 ** exponent)
+
     # ========= inference  ============
     def conditional_sample(self, 
             condition_data, 
@@ -476,7 +517,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
 
         return traj
 
-    def compute_loss(self, batch, ema_model=None, **kwargs):
+    def compute_loss(self, batch, ema_model=None, epoch=None, num_epochs=None, **kwargs):
         # normalize input
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action']).to(self.device)
@@ -525,6 +566,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 vis_cond=vis_cond[:flow_batchsize],
                 lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
                 return_block_output=self.sra_block_out_s,
+                apply_sra_head=True,
             )
         else:
             v_flow_pred = self.model(
@@ -560,6 +602,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             )
             target_t_teacher = torch.zeros_like(t_teacher)  # instantaneous velocity
             with torch.no_grad():
+                # apply_sra_head intentionally omitted (defaults to False): the
+                # teacher representation stays un-projected, matching SRA/DiT-SRA
+                # where only the student passes through the predictor head.
                 _, teacher_repr = ema_model.model(
                     sample=x_t_teacher,
                     timestep=t_teacher,
@@ -569,10 +614,12 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                     return_block_output=self.sra_block_out_t,
                 )
             loss_sra = F.smooth_l1_loss(student_repr, teacher_repr, beta=0.05)
-            loss += loss_sra * self.sra_loss_weight
+            sra_weight = self._sra_effective_weight(epoch=epoch, num_epochs=num_epochs)
+            loss += loss_sra * sra_weight
             loss_sra = loss_sra.item()
         else:
             loss_sra = 0.0
+            sra_weight = 0.0
 
         if self.use_consistency:
             # Get consistency targets
@@ -606,6 +653,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 'loss_flow': loss_flow,
                 'loss_ct': loss_ct,
                 'loss_sra': loss_sra,
+                'sra_weight': sra_weight,
                 'v_flow_pred_magnitude': v_flow_pred_magnitude,
                 'v_ct_pred_magnitude': v_ct_pred_magnitude,
                 'bc_loss': loss.item(),
