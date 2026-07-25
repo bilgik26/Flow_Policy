@@ -29,7 +29,7 @@ task_names:
 
 # Base path to downloaded LeRobot datasets
 # Override via hydra: task.dataset_base_path=/path/to/datasets
-dataset_base_path: /home/bilgehan.sakai/Flow_Policy/robocasa/datasets/v1.0/pretrain/atomic
+dataset_base_path: /home/bilgehan.sakai/Flow_Policy/data/robocasa/datasets/v1.0/pretrain/atomic
 
 dataset:
   _target_: maniflow.dataset.robocasa_dataset.RoboCasaImageDataset

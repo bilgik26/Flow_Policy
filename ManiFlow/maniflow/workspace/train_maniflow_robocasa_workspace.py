@@ -168,7 +168,9 @@ class TrainManiFlowRoboCasaWorkspace:
                     if train_sampling_batch is None:
                         train_sampling_batch = batch
 
-                    raw_loss, loss_dict = self.model.compute_loss(batch, self.ema_model)
+                    raw_loss, loss_dict = self.model.compute_loss(
+                        batch, self.ema_model, epoch=self.epoch, num_epochs=cfg.training.num_epochs
+                    )
                     if not torch.isfinite(raw_loss):
                         n_skipped += 1  # NaN/Inf batch をスキップ（カウントして可視化）
                         continue
@@ -255,7 +257,9 @@ class TrainManiFlowRoboCasaWorkspace:
                             batch = dict_apply(
                                 batch, lambda x: x.to(device, non_blocking=True)
                             )
-                            loss, _ = self.model.compute_loss(batch, self.ema_model)
+                            loss, _ = self.model.compute_loss(
+                                batch, self.ema_model, epoch=self.epoch, num_epochs=cfg.training.num_epochs
+                            )
                             val_losses.append(loss.item())
                             if (cfg.training.max_val_steps is not None) and batch_idx >= (
                                 cfg.training.max_val_steps - 1

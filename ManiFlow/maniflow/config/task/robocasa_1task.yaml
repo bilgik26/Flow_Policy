@@ -16,7 +16,7 @@ shape_meta:
 # データセット実パス: robocasa/datasets/v1.0/pretrain/atomic/TurnOffMicrowave
 # download_datasets が <task>/<date>/lerobot/ に展開するため、
 # _resolve_lerobot_root() が自動的に正しいパスを探す。
-dataset_base_path: /home/bilgehan.sakai/Flow_Policy/robocasa/datasets/v1.0/pretrain/atomic
+dataset_base_path: /home/bilgehan.sakai/Flow_Policy/data/robocasa/datasets/v1.0/pretrain/atomic
 
 dataset:
   _target_: maniflow.dataset.robocasa_dataset.RoboCasaImageDataset
