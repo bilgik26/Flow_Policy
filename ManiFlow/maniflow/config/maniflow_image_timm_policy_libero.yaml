@@ -39,6 +39,12 @@ policy:
   sra_block_out_t: 8
   sra_t_max: 0.2
   sra_loss_weight: 1.0
+  # If true, sra_loss_weight is annealed over training epochs (SRA/DiT-SRA-style
+  # decay); if false, sra_loss_weight is applied flat with no epoch-based decay.
+  sra_weight_schedule: true
+  sra_weight_base_scale: 0.4
+  sra_weight_decay_start_frac: 0.186  # 149 / 801
+  sra_weight_decay_span_frac: 1.248   # 1000 / 801
 
   sample_t_mode_flow: "beta"
   sample_t_mode_consistency: "discrete"

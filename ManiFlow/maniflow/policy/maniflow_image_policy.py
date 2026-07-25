@@ -54,6 +54,9 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             # are tuned for its own 801-epoch ImageNet schedule; here they are
             # expressed as *fractions* of this run's num_epochs so the same
             # proportions apply regardless of how long training runs.
+            # Set sra_weight_schedule=False to disable this epoch-based decay
+            # and use the flat sra_loss_weight for every step instead.
+            sra_weight_schedule=True,
             sra_weight_base_scale=0.4,
             sra_weight_decay_start_frac=149 / 801,
             sra_weight_decay_span_frac=1000 / 801,
@@ -132,6 +135,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         self.sra_block_out_t = sra_block_out_t
         self.sra_t_max = sra_t_max
         self.sra_loss_weight = sra_loss_weight
+        self.sra_weight_schedule = sra_weight_schedule
         self.sra_weight_base_scale = sra_weight_base_scale
         self.sra_weight_decay_start_frac = sra_weight_decay_start_frac
         self.sra_weight_decay_span_frac = sra_weight_decay_span_frac
@@ -155,9 +159,11 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             cprint(f"  - sra_block_out_t: {self.sra_block_out_t}", "yellow")
             cprint(f"  - sra_t_max: {self.sra_t_max}", "yellow")
             cprint(f"  - sra_loss_weight: {self.sra_loss_weight}", "yellow")
-            cprint(f"  - sra_weight_base_scale: {self.sra_weight_base_scale}", "yellow")
-            cprint(f"  - sra_weight_decay_start_frac: {self.sra_weight_decay_start_frac}", "yellow")
-            cprint(f"  - sra_weight_decay_span_frac: {self.sra_weight_decay_span_frac}", "yellow")
+            cprint(f"  - sra_weight_schedule: {self.sra_weight_schedule}", "yellow")
+            if self.sra_weight_schedule:
+                cprint(f"  - sra_weight_base_scale: {self.sra_weight_base_scale}", "yellow")
+                cprint(f"  - sra_weight_decay_start_frac: {self.sra_weight_decay_start_frac}", "yellow")
+                cprint(f"  - sra_weight_decay_span_frac: {self.sra_weight_decay_span_frac}", "yellow")
 
         print_params(self)
 
@@ -173,11 +179,12 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         `start`. `start`/`span` are given here as fractions of num_epochs so
         the proportions match regardless of this run's total epoch count.
 
-        Falls back to the flat `sra_loss_weight` (no decay) if epoch/num_epochs
+        Falls back to the flat `sra_loss_weight` (no decay) if scheduling is
+        disabled via `sra_weight_schedule=False`, or if epoch/num_epochs
         aren't provided, e.g. when compute_loss is called from a context that
         doesn't track training progress.
         """
-        if epoch is None or num_epochs is None or num_epochs <= 0:
+        if not self.sra_weight_schedule or epoch is None or num_epochs is None or num_epochs <= 0:
             return self.sra_loss_weight
         start = self.sra_weight_decay_start_frac * num_epochs
         span = self.sra_weight_decay_span_frac * num_epochs

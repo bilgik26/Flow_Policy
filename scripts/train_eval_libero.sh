@@ -23,6 +23,9 @@
 #   bash scripts/train_eval_libero.sh 0 0   smoke        train libero_test    # quick smoke test
 
 set -euo pipefail
+set -a
+source .env
+set +a
 
 GPU="${1:-0}"
 SEED="${2:-42}"
