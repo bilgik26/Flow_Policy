@@ -1,0 +1,209 @@
+defaults:
+  - task: libero_spatial
+
+name: train_maniflow_image_timm_policy_libero
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "libero"
+
+horizon: 10           # n_obs_steps(2) + n_action_steps(8)
+n_obs_steps: 2
+n_action_steps: 8     # openvla-oft's LIBERO action-chunk size (NUM_ACTIONS_CHUNK)
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+obs_as_global_cond: true
+
+eval_inference_steps: [10]
+
+policy:
+  _target_: maniflow.policy.maniflow_image_policy.ManiFlowTransformerImagePolicy
+  block_type: "DiTX"
+  n_layer: 12
+  n_head: 8
+  n_emb: 768
+  visual_cond_len: 1024
+  max_lang_cond_len: 1024
+  qkv_bias: false
+  qk_norm: false
+
+  language_conditioned: false
+  pre_norm_modality: false
+
+  use_consistency: true
+  flow_batch_ratio: 0.75
+  consistency_batch_ratio: 0.25
+
+  use_sra: false
+  sra_block_out_s: 4
+  sra_block_out_t: 8
+  sra_t_max: 0.2
+  sra_loss_weight: 1.0
+
+  sample_t_mode_flow: "beta"
+  sample_t_mode_consistency: "discrete"
+  sample_dt_mode_consistency: "uniform"
+  sample_target_t_mode: "relative"
+  denoise_timesteps: 10
+
+  diffusion_timestep_embed_dim: 128
+  diffusion_target_t_embed_dim: 128
+
+  horizon: ${horizon}
+  n_action_steps: ${n_action_steps}
+  n_obs_steps: ${n_obs_steps}
+
+  num_inference_steps: 10
+  obs_as_global_cond: true
+  shape_meta: ${shape_meta}
+
+  obs_encoder:
+    _target_: maniflow.model.vision_2d.timm_obs_encoder.TimmObsEncoder
+    shape_meta: ${shape_meta}
+
+    model_name: 'r3m'
+    pretrained: false
+    frozen: false
+
+    global_pool: ''
+    feature_aggregation: null
+    position_encording: 'sinusoidal'
+
+    downsample_ratio: 32
+
+    transforms:
+      - type: RandomCrop
+        ratio: 0.95
+      - _target_: torchvision.transforms.RandomRotation
+        degrees:
+          - -5.0
+          - 5.0
+        expand: false
+      - _target_: torchvision.transforms.ColorJitter
+        brightness: 0.3
+        contrast: 0.4
+        saturation: 0.5
+        hue: 0.08
+
+    use_group_norm: true
+    share_rgb_model: false
+    imagenet_norm: true
+
+
+ema:
+  _target_: maniflow.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: true
+  pin_memory: true
+  persistent_workers: true
+  # Set true to decode video via NVIDIA DALI (hardware NVDEC) instead of the
+  # default decord (CPU) path. Measured ~6x faster raw per-sample decode on
+  # this dataset's GOP=10 videos (see scripts/reencode_libero_videos.py) and
+  # runs with no CPU worker processes at all, so num_workers/persistent_workers
+  # above are ignored when this is true — see
+  # maniflow/dataset/libero_dataset_dali.py and docs/setup_and_train_libero.md.
+  use_dali: false
+  dali_num_threads: 4  # DALI's own CPU-side threads (file I/O), not decode
+
+val_dataloader:
+  batch_size: 128
+  num_workers: 8
+  shuffle: false
+  pin_memory: true
+  persistent_workers: true
+  use_dali: false
+  dali_num_threads: 4
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+  weight_decay: 1.0e-3
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: false
+  resume: true
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  num_epochs: 501
+  gradient_accumulate_every: 1
+  use_ema: true
+  # torch.compile the DiTX transformer's forward pass (both the live model and
+  # the EMA copy, since consistency training calls ema_model.model every step
+  # too — see train_maniflow_libero_workspace.py's compile wiring).
+  # Measured NOT beneficial for this model/config: ~1.02x steady-state
+  # speedup (i.e. essentially none) after a ~40s one-time graph-compile cost,
+  # and it crashed with an inductor assert_size_stride AssertionError on the
+  # 2nd real training step in an end-to-end test (dynamic-shape/stride issue
+  # in the compiled backward graph). Left here as an opt-in, off-by-default
+  # experiment rather than removed, in case a future inductor/torch version
+  # or model config fixes/changes this — do not enable for real training runs
+  # yet. See docs/setup_and_train_libero.md.
+  compile: false
+  compile_mode: default  # default | reduce-overhead | max-autotune
+  # Multi-GPU (DDP) training: num_gpus>1 spawns one process per GPU via
+  # torch.multiprocessing, each holding a copy of the model on its own device.
+  # dataloader.batch_size below is PER GPU, so global batch size scales as
+  # dataloader.batch_size * num_gpus. `distributed` is set programmatically at
+  # launch (train_maniflow_libero_workspace.py::main) — do not set it by hand.
+  num_gpus: 1
+  distributed: false
+  # ManiFlowTransformerImagePolicy (and its submodules) inherit ModuleAttrMixin,
+  # which adds a `_dummy_variable` nn.Parameter purely so the module can report
+  # its device/dtype — it never participates in any forward pass, so DDP always
+  # sees at least one genuinely-unused parameter. Keep this true; only set it
+  # false if you've verified (e.g. via TORCH_DISTRIBUTED_DEBUG=DETAIL) that no
+  # parameters are unused for your specific policy config, since find_unused
+  # =True has a small perf cost from the extra autograd-graph traversal.
+  ddp_find_unused_parameters: true
+  rollout_every: 500    # run env rollout every N epochs
+  checkpoint_every: 100
+  val_every: 50
+  sample_every: 5
+  max_train_steps: null
+  max_val_steps: null
+  tqdm_interval_sec: 1.0
+
+logging:
+  group: ${exp_name}
+  id: null
+  mode: online
+  name: ${training.seed}
+  project: flow_policy_libero
+  resume: true
+  tags:
+    - ${logging.project}
+
+checkpoint:
+  save_ckpt: true
+  topk:
+    monitor_key: val_loss
+    mode: min
+    k: 3
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}.ckpt'
+  save_last_ckpt: true
+  save_last_snapshot: false
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}

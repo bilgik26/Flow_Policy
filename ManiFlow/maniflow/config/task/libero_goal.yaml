@@ -1,0 +1,61 @@
+name: libero_goal
+
+# Set false to drop the wrist camera entirely (both from the dataset
+# decode and from shape_meta, so the obs_encoder never builds a branch
+# for it) — halves per-sample video decode time at the cost of losing
+# the wrist camera's close-up/occlusion-robust view. See docs/setup_and_train_libero.md.
+use_wrist_image: true
+
+shape_meta:
+  obs:
+    image:
+      shape: [3, 256, 256]
+      type: rgb
+      horizon: ${n_obs_steps}
+    wrist_image:
+      shape: [3, 256, 256]
+      type: rgb
+      horizon: ${n_obs_steps}
+    agent_pos:
+      shape: [8]
+      type: low_dim
+      horizon: ${n_obs_steps}
+  action:
+    shape: [7]
+
+# LIBERO task suite name (must match a key of
+# libero.libero.benchmark.get_benchmark_dict()).
+task_suite_name: libero_goal
+
+# Root of the LeRobot-format dataset produced by
+#   python scripts/convert_libero_to_lerobot.py --libero_task_suite libero_goal \
+#       --libero_raw_data_dir <RAW_HDF5_DIR> --libero_target_dir ${dataset_base_path}
+# One LeRobot dataset per task is auto-discovered under this root
+# (see maniflow/dataset/libero_dataset.py::_discover_lerobot_dirs).
+dataset_base_path: /home/bilgehan.sakai/Flow_Policy/data/libero/datasets/lerobot/libero_goal
+
+dataset:
+  _target_: maniflow.dataset.libero_dataset.LiberoImageDataset
+  dataset_dirs: ${task.dataset_base_path}
+  horizon: ${horizon}
+  pad_before: ${eval:'${n_obs_steps}-1'}
+  pad_after: ${eval:'${n_action_steps}-1'}
+  seed: ${training.seed}
+  val_ratio: 0.02
+  image_size: 256
+  task_name: ${name}
+  use_wrist_image: ${task.use_wrist_image}
+
+env_runner:
+  _target_: maniflow.env_runner.libero_runner.LiberoRunner
+  task_suite_name: libero_goal
+  task_ids: [0]              # canonical single task for fast periodic rollouts during training
+  eval_episodes_per_task: 20
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  num_open_loop_steps: 8
+  image_size: 256
+  num_steps_wait: 10
+  max_episode_steps: null    # null -> LiberoEnv.TASK_MAX_STEPS[task_suite_name]
+  fps: 20
+  tqdm_interval_sec: 1.0

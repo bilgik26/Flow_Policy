@@ -20,11 +20,17 @@ dependencies = [
     "diffusers==0.27.2",
     "accelerate==0.34.2",
     "deepspeed==0.15.1",
+    # diffusers==0.27.2 imports huggingface_hub.cached_download, removed in
+    # huggingface_hub>=0.26 — pin to the version RoboCasa's .venv already
+    # resolved so both venvs stay consistent (see docs/setup_and_train_libero.md
+    # troubleshooting: "ImportError: cannot import name 'cached_download'").
+    "huggingface_hub==0.25.2",
     # Data / image
     "numpy<2.0",
     "pandas",
     "pyarrow",
     "av",               # PyAV for mp4 decoding
+    "decord",           # fast random-access mp4 frame decoding (maniflow/dataset/libero_dataset.py)
     "opencv-python-headless",
     "imageio",
     "imageio-ffmpeg",
@@ -42,6 +48,8 @@ dependencies = [
     "numba==0.63.1",
     "llvmlite==0.46.0",
     "lerobot",          # for video_utils used by robocasa
+    # LIBERO dataset conversion (scripts/convert_libero_to_lerobot.py)
+    "h5py",
     # Flash attention (optional, comment out if build fails)
     # "flash-attn",
 ]
@@ -52,6 +60,15 @@ cu128 = [
     "torch==2.7.0+cu128",
     "torchvision==0.22.0+cu128",
     "torchaudio==2.7.0+cu128",
+]
+# Optional GPU (NVDEC hardware) video decode backend for
+# maniflow/dataset/libero_dataset_dali.py, enabled via
+# dataloader.use_dali=true — see docs/setup_and_train_libero.md. A 400+MB
+# wheel bundling its own CUDA 12.x runtime libs, kept out of the base
+# dependencies since decord (CPU) remains the default. Requires an
+# NVDEC-capable NVIDIA GPU.
+dali = [
+    "nvidia-dali-cuda120",
 ]
 
 [tool.uv]
@@ -79,5 +96,22 @@ robocasa = [
     # After uv sync, run:
     #   uv pip install 'robosuite @ git+https://github.com/ARISE-Initiative/robosuite.git'
     #   uv pip install -e robocasa/
+    #   uv pip install -e ManiFlow/
+]
+libero = [
+    # LIBERO requires robosuite==1.4.1, which conflicts with RoboCasa's
+    # robosuite@main requirement above — install into a SEPARATE venv
+    # (.venv-libero), not the default .venv. See docs/setup_and_train_libero.md.
+    #   UV_PROJECT_ENVIRONMENT=.venv-libero uv sync --extra cu128 --python 3.10
+    #   source .venv-libero/bin/activate
+    #   uv pip install 'robosuite==1.4.1'
+    #   uv pip install --config-settings editable_mode=compat -e libero/
+    #     (plain `-e libero/` fails: setup.py's find_packages() can't see
+    #      libero.libero/libero.lifelong because the top "libero" dir has no
+    #      __init__.py, so the PEP 660 editable finder gets an empty package
+    #      map; `editable_mode=compat` falls back to a classic sys.path .pth
+    #      file, which resolves the implicit namespace package correctly)
+    #   uv pip install bddl easydict cloudpickle gym
+    #   uv pip install -e third_party/r3m   # needed by TimmObsEncoder(model_name='r3m')
     #   uv pip install -e ManiFlow/
 ]
