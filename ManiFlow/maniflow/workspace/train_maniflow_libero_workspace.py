@@ -37,6 +37,7 @@ from termcolor import cprint
 from maniflow.dataset.base_dataset import BaseDataset
 from maniflow.env_runner.base_runner import BaseRunner
 from maniflow.common.checkpoint_util import TopKCheckpointManager
+from maniflow.common.logger_util import LargestKRecorder
 from maniflow.common.pytorch_util import dict_apply, optimizer_to
 from maniflow.model.diffusion.ema_model import EMAModel
 from maniflow.model.common.lr_scheduler import get_scheduler
@@ -146,6 +147,64 @@ def _build_dali_loader(dataset, dl_cfg: OmegaConf, cfg: OmegaConf, num_shards: i
     )
 
 
+def _merge_rollout_logs(partial_logs: list, logger3: LargestKRecorder, logger5: LargestKRecorder) -> dict:
+    """Combine one LiberoRunner.run() result per DDP rank (each covering a
+    disjoint round-robin slice of cfg.task.env_runner.eval_tasks — see run()'s
+    env_runner setup) into a single training-run-wide rollout log.
+
+    Per-suite/per-task keys (SR_<suite>_taskNN, mean_success_rate_<suite>,
+    sim_video_eval_*) never collide across ranks, since eval_tasks entries are
+    always sliced whole (never split within one suite's task_ids across two
+    ranks) — those are just unioned as-is. The overall aggregate keys
+    (mean_success_rates/mean_seen_success_rates/mean_unseen_success_rates/
+    test_mean_score/SR_test_L3/SR_test_L5/task_suite_name) are recomputed
+    here from every rank's raw success sum/count instead, since each rank's
+    own LiberoRunner only ever saw its own slice and its "overall" fields
+    describe just that slice, not the whole training run. Rank slots with no
+    work this rollout (more ranks than eval_tasks entries) contribute an
+    empty dict and are skipped.
+    """
+    merged = {}
+    total_success_sum = 0.0
+    total_success_count = 0
+    group_success_sum = {"seen": 0.0, "unseen": 0.0}
+    group_success_count = {"seen": 0, "unseen": 0}
+    suite_names = []
+    for plog in partial_logs:
+        if not plog:
+            continue
+        plog = dict(plog)
+        suite_names.append(plog.pop("task_suite_name", ""))
+        total_success_sum += plog.pop("_success_sum", 0.0)
+        total_success_count += plog.pop("_success_count", 0)
+        for group in group_success_sum:
+            group_success_sum[group] += plog.pop(f"_success_sum_{group}", 0.0)
+            group_success_count[group] += plog.pop(f"_success_count_{group}", 0)
+        plog.pop("mean_success_rates", None)
+        plog.pop("mean_seen_success_rates", None)
+        plog.pop("mean_unseen_success_rates", None)
+        plog.pop("test_mean_score", None)
+        plog.pop("SR_test_L3", None)
+        plog.pop("SR_test_L5", None)
+        merged.update(plog)
+
+    mean_sr = (total_success_sum / total_success_count) if total_success_count else 0.0
+    logger3.record(mean_sr)
+    logger5.record(mean_sr)
+    merged["task_suite_name"] = "+".join(dict.fromkeys(n for n in suite_names if n))
+    merged["mean_success_rates"] = mean_sr
+    merged["test_mean_score"] = mean_sr
+    merged["SR_test_L3"] = logger3.average_of_largest_K()
+    merged["SR_test_L5"] = logger5.average_of_largest_K()
+    for group in group_success_sum:
+        merged[f"mean_{group}_success_rates"] = (
+            group_success_sum[group] / group_success_count[group]
+            if group_success_count[group]
+            else 0.0
+        )
+    return merged
+
+
 class TrainManiFlowLiberoWorkspace:
     include_keys = ["global_step", "epoch"]
     exclude_keys = ()
@@ -188,6 +247,15 @@ class TrainManiFlowLiberoWorkspace:
         )
         self.global_step = 0
         self.epoch = 0
+
+        # Rollout is distributed across DDP ranks (see run()'s env_runner
+        # setup and _merge_rollout_logs below): each rank's LiberoRunner only
+        # sees a slice of cfg.task.env_runner.eval_tasks, so no single
+        # LiberoRunner instance can track the training-run-wide top-K rollout
+        # scores itself. These two live on the workspace (rank0 only ever
+        # reads them) instead, fed the merged mean_success_rates each rollout.
+        self._rollout_logger3 = LargestKRecorder(K=3)
+        self._rollout_logger5 = LargestKRecorder(K=5)
 
     # ── Main training loop ──────────────────────────────────────────────────
 
@@ -256,6 +324,7 @@ class TrainManiFlowLiberoWorkspace:
         normalizer = dataset.get_normalizer()
 
         val_loader = None
+        val_loaders_by_suite = {}
         if is_main_process:
             val_dataset = dataset.get_validation_dataset()
             if cfg.val_dataloader.get("use_dali", False):
@@ -265,10 +334,55 @@ class TrainManiFlowLiberoWorkspace:
             else:
                 val_loader = DataLoader(val_dataset, **_torch_dataloader_kwargs(cfg.val_dataloader))
 
+            # Multi-suite mixes (e.g. libero_all4) additionally get one val
+            # loader per suite, so the validation section below can log a
+            # per-suite val_loss alongside the pooled/global one. Single-suite
+            # datasets (or any BaseDataset without this method) just skip
+            # this. Mirrors val_loader's own use_dali branch immediately
+            # above -- building these via plain torch DataLoader regardless
+            # of cfg.val_dataloader.use_dali would silently reintroduce CPU
+            # worker processes on a host where DALI was specifically chosen
+            # to avoid them (see dataloader.use_dali's config comment).
+            #
+            # persistent_workers forced False in the non-DALI branch
+            # (overriding cfg.val_dataloader, num_workers otherwise
+            # unchanged) -- these loaders are only ever iterated once every
+            # training.val_every epochs, so it's not worth 4 suites' worth of
+            # persistent worker processes sitting idle for the rest of
+            # training; see libero_dataset.py's _READER_CACHE_SIZE comment
+            # on this host's known RAM pressure from num_workers>1.
+            if hasattr(dataset, "get_validation_dataset_per_suite"):
+                per_suite_val_datasets = dataset.get_validation_dataset_per_suite()
+                if len(per_suite_val_datasets) > 1:
+                    if cfg.val_dataloader.get("use_dali", False):
+                        for suite_name, suite_val_dataset in per_suite_val_datasets.items():
+                            if len(suite_val_dataset) == 0:
+                                continue
+                            val_loaders_by_suite[suite_name] = _build_dali_loader(
+                                suite_val_dataset, cfg.val_dataloader, cfg, num_shards=1, shard_id=0
+                            )
+                    else:
+                        val_dl_kwargs = dict(_torch_dataloader_kwargs(cfg.val_dataloader))
+                        val_dl_kwargs["persistent_workers"] = False
+                        for suite_name, suite_val_dataset in per_suite_val_datasets.items():
+                            if len(suite_val_dataset) == 0:
+                                continue
+                            val_loaders_by_suite[suite_name] = DataLoader(
+                                suite_val_dataset, **val_dl_kwargs
+                            )
+
             cprint(f"Dataset: {dataset.__class__.__name__}", "red")
             cprint(
                 f"Train samples: {len(dataset)}  Val samples: {len(val_dataset)}", "red"
             )
+            if val_loaders_by_suite:
+                cprint(
+                    "Per-suite val samples: "
+                    + ", ".join(
+                        f"{s}={len(dl.dataset)}" for s, dl in val_loaders_by_suite.items()
+                    ),
+                    "red",
+                )
             if self.distributed:
                 cprint(
                     f"Distributed: {cfg.training.num_gpus} GPUs, "
@@ -296,13 +410,21 @@ class TrainManiFlowLiberoWorkspace:
         if cfg.training.use_ema:
             ema = hydra.utils.instantiate(cfg.ema, model=self.ema_model)
 
-        # Env runner (only for rollout evaluation, main process only — osmesa
-        # rendering + env stepping is not distributed across ranks)
+        # Env runner (rollout evaluation). Built on every rank — under DDP each
+        # rank keeps only a round-robin slice of cfg.task.env_runner.eval_tasks
+        # (whole suite entries, never a suite's task_ids split across ranks) so
+        # rollout runs in parallel across GPUs instead of solely on rank 0; see
+        # _merge_rollout_logs for how the per-rank partial results are combined
+        # back into one training-run-wide log on rank 0. A single-suite config
+        # (task_suite_name, not eval_tasks) still lands its one entry on rank 0
+        # only, exactly like before DDP-distributing rollout was added.
         env_runner: BaseRunner = None
-        if is_main_process and RUN_ROLLOUT:
+        if RUN_ROLLOUT:
             env_runner = hydra.utils.instantiate(
                 cfg.task.env_runner, output_dir=self.output_dir
             )
+            if self.distributed:
+                env_runner.eval_tasks = env_runner.eval_tasks[self.local_rank :: cfg.training.num_gpus]
 
         wandb_run = None
         topk = None
@@ -447,33 +569,62 @@ class TrainManiFlowLiberoWorkspace:
                         flush=True,
                     )
 
-            # The rest of the epoch (rollout / validation / sampling / checkpoint /
+            # Rollout eval — skip epoch 0 (model is untrained, rollout would
+            # just waste time). Runs on every rank (not just rank 0): each
+            # rank's env_runner already holds only its own round-robin slice
+            # of cfg.task.env_runner.eval_tasks (see env_runner setup above),
+            # so suites/tasks evaluate in parallel across GPUs instead of all
+            # serializing on rank 0 while ranks 1..N-1 idle at the barrier
+            # below. gather_object collects every rank's partial result onto
+            # rank 0, which _merge_rollout_logs combines into one
+            # training-run-wide log (see its docstring for why the overall
+            # mean_success_rates/SR_test_L3/L5/etc. must be recomputed there
+            # rather than trusted from any single rank's partial view).
+            rollout_log_update = None
+            do_rollout = (
+                RUN_ROLLOUT
+                and env_runner is not None
+                and self.epoch > 0
+                and (self.epoch % cfg.training.rollout_every) == 0
+            )
+            if do_rollout:
+                policy = self.ema_model if cfg.training.use_ema else self.model
+                policy.eval()
+                local_runner_log = env_runner.run(policy) if env_runner.eval_tasks else {}
+                policy.train()
+
+                if self.distributed:
+                    gathered = [None] * cfg.training.num_gpus if is_main_process else None
+                    dist.gather_object(local_runner_log, gathered if is_main_process else None, dst=0)
+                else:
+                    gathered = [local_runner_log]
+
+                if is_main_process:
+                    rollout_log_update = _merge_rollout_logs(
+                        gathered, self._rollout_logger3, self._rollout_logger5
+                    )
+            elif self.epoch == 0 and is_main_process:
+                rollout_log_update = {
+                    "test_mean_score": 0.0,
+                    "mean_success_rates": 0.0,
+                    "mean_seen_success_rates": 0.0,
+                    "mean_unseen_success_rates": 0.0,
+                    "SR_test_L3": 0.0,
+                    "SR_test_L5": 0.0,
+                }
+
+            # The rest of the epoch (validation / sampling / checkpoint /
             # logging) runs on the main process only; other ranks wait at the
             # barrier below so they resume the next epoch's DDP forward/backward
             # in lockstep with rank 0.
             if is_main_process:
-                # Policy used for eval / sampling
+                # Policy used for sampling below (rollout, if any, already ran
+                # just above — in parallel across ranks — before this section).
                 policy = self.ema_model if cfg.training.use_ema else self.model
                 policy.eval()
 
-                # Rollout (skip epoch 0: model is untrained, rollout would just waste time)
-                if (
-                    RUN_ROLLOUT
-                    and env_runner is not None
-                    and self.epoch > 0
-                    and (self.epoch % cfg.training.rollout_every) == 0
-                ):
-                    runner_log = env_runner.run(policy)
-                    step_log.update(runner_log)
-                elif self.epoch == 0:
-                    step_log.update(
-                        {
-                            "test_mean_score": 0.0,
-                            "mean_success_rates": 0.0,
-                            "SR_test_L3": 0.0,
-                            "SR_test_L5": 0.0,
-                        }
-                    )
+                if rollout_log_update is not None:
+                    step_log.update(rollout_log_update)
 
                 # Validation
                 if RUN_VALIDATION and (self.epoch % cfg.training.val_every) == 0:
@@ -509,6 +660,29 @@ class TrainManiFlowLiberoWorkspace:
                                 )
                             # nanmean: 万が一 NaN が混入した場合も残りの値で平均を取る
                             step_log["val_loss"] = float(np.nanmean(val_losses))
+
+                        # Per-suite val_loss for multi-suite mixes (e.g.
+                        # libero_all4) -- separate small loader per suite
+                        # (see val_loaders_by_suite construction above),
+                        # logged as val_loss_<suite> alongside the pooled
+                        # "val_loss" above (which stays the
+                        # checkpoint.topk.monitor_key).
+                        for suite_name, suite_val_loader in val_loaders_by_suite.items():
+                            suite_val_losses = []
+                            for batch_idx, batch in enumerate(suite_val_loader):
+                                batch = dict_apply(
+                                    batch, lambda x: x.to(device, non_blocking=True)
+                                )
+                                loss, _ = self.model.compute_loss(
+                                    batch, self.ema_model, epoch=self.epoch, num_epochs=cfg.training.num_epochs
+                                )
+                                suite_val_losses.append(loss.item())
+                                if (cfg.training.max_val_steps is not None) and batch_idx >= (
+                                    cfg.training.max_val_steps - 1
+                                ):
+                                    break
+                            if suite_val_losses:
+                                step_log[f"val_loss_{suite_name}"] = float(np.nanmean(suite_val_losses))
 
                 # Sample action MSE on training batch
                 if (self.epoch % cfg.training.sample_every) == 0:
@@ -735,7 +909,14 @@ def _run_worker(local_rank: int, cfg, world_size: int, output_dir: str):
             # Rank 0 alone runs rollout eval (see run()); with multiple tasks x
             # episodes this can exceed NCCL's default 10-minute collective
             # timeout, aborting the whole process group at the barrier below.
-            timeout=timedelta(minutes=60),
+            # 60 min was enough for a single-suite rollout (e.g. task_ids=[0],
+            # ~20 episodes) but a multi-suite eval_tasks rollout (e.g.
+            # libero_all4's 4 suites x 2 tasks x 10 episodes = 80 episodes,
+            # including libero_10's long ~520-step horizon) measured ~90+ min
+            # end to end — pick a generous multiple of that so a slower rollout
+            # (e.g. lower success rate -> episodes running to max_episode_steps
+            # instead of terminating early) doesn't retrigger this.
+            timeout=timedelta(minutes=240),
         )
         cfg.training.distributed = True
     else:

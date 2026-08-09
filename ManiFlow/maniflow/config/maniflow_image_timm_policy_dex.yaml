@@ -107,6 +107,8 @@ ema:
   power: 0.75
   min_value: 0.0
   max_value: 0.9999
+  use_decay_schedule: true  # true: warmup schedule, false: fixed_decay
+  fixed_decay: 0.9999
 
 dataloader:
   batch_size: 384

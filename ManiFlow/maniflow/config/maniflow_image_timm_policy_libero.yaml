@@ -46,6 +46,19 @@ policy:
   sra_weight_decay_start_frac: 0.186  # 149 / 801
   sra_weight_decay_span_frac: 1.248   # 1000 / 801
 
+  # SRA/DTS/AS (SRA/SiT-SRA_DTS_AS) extensions: mix multiple noise levels into
+  # one action-horizon sequence via a token-group mask, with dual-time
+  # scheduling (DTS, independent timestep per group) and attention separation
+  # (AS, block cross-group self-attention). Only takes effect when use_sra is
+  # also true. See docs/sra_dts_as.md for the full algorithm mapping.
+  sra_mask_ratio: 0.25          # -> two groups [0.25, 0.75], matching SiT-SRA_DTS_AS's default
+  sra_dual_time_scheduling: true
+  sra_attention_separation: true
+  sra_teacher_mask: true
+  sra_full_sample_prob: 0.0
+  sra_teacher_t: "self_flow"    # "self_flow" | "same" | "sra"
+  sra_loss_type: "sml1"         # "sml1" | "l2" | "l1" | "cos"
+
   sample_t_mode_flow: "beta"
   sample_t_mode_consistency: "discrete"
   sample_dt_mode_consistency: "uniform"
@@ -103,6 +116,8 @@ ema:
   power: 0.75
   min_value: 0.0
   max_value: 0.9999
+  use_decay_schedule: true  # true: warmup schedule, false: fixed_decay
+  fixed_decay: 0.999
 
 dataloader:
   batch_size: 128

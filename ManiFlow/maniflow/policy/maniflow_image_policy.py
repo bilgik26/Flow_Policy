@@ -11,6 +11,7 @@ from maniflow.common.model_util import print_params
 from maniflow.model.vision_2d.timm_obs_encoder import TimmObsEncoder
 from maniflow.model.diffusion.ditx import DiTX
 from maniflow.model.common.sample_util import *
+from maniflow.model.diffusion.sra_mask import build_group_mask, mix_group_values, normalize_mask_ratios
 
 class ManiFlowTransformerImagePolicy(BasePolicy):
     def __init__(self, 
@@ -60,6 +61,19 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             sra_weight_base_scale=0.4,
             sra_weight_decay_start_frac=149 / 801,
             sra_weight_decay_span_frac=1000 / 801,
+            # SRA/DTS/AS (SRA/SiT-SRA_DTS_AS) extensions: mixing multiple noise
+            # levels into one action-horizon sequence via a token-group mask,
+            # with dual-time scheduling (DTS) and attention separation (AS).
+            # Defaults reproduce the plain-SRA behavior above exactly
+            # (sra_mask_ratio normalizes to a single group => masking is a
+            # no-op, see maniflow.model.diffusion.sra_mask.normalize_mask_ratios).
+            sra_mask_ratio=1.0,
+            sra_dual_time_scheduling=False,
+            sra_attention_separation=False,
+            sra_teacher_mask=False,
+            sra_full_sample_prob=0.0,
+            sra_teacher_t="sra",
+            sra_loss_type="sml1",
             **kwargs):
         super().__init__()
 
@@ -103,6 +117,7 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
             block_type=block_type,
             language_conditioned=language_conditioned,
             use_sra=use_sra,
+            attention_separation=sra_attention_separation,
         )
         
         self.obs_encoder = obs_encoder
@@ -140,6 +155,16 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         self.sra_weight_decay_start_frac = sra_weight_decay_start_frac
         self.sra_weight_decay_span_frac = sra_weight_decay_span_frac
 
+        # SRA/DTS/AS extensions
+        self.sra_mask_ratio = normalize_mask_ratios(sra_mask_ratio)
+        self.sra_num_mask_groups = len(self.sra_mask_ratio)
+        self.sra_dual_time_scheduling = sra_dual_time_scheduling
+        self.sra_attention_separation = sra_attention_separation
+        self.sra_teacher_mask = sra_teacher_mask
+        self.sra_full_sample_prob = sra_full_sample_prob
+        self.sra_teacher_t = sra_teacher_t
+        self.sra_loss_type = sra_loss_type
+
         cprint(f"[ManiFlowTransformerImagePolicy] Initialized with parameters:", "yellow")
         cprint(f"  - horizon: {self.horizon}", "yellow")
         cprint(f"  - n_action_steps: {self.n_action_steps}", "yellow")
@@ -164,6 +189,14 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 cprint(f"  - sra_weight_base_scale: {self.sra_weight_base_scale}", "yellow")
                 cprint(f"  - sra_weight_decay_start_frac: {self.sra_weight_decay_start_frac}", "yellow")
                 cprint(f"  - sra_weight_decay_span_frac: {self.sra_weight_decay_span_frac}", "yellow")
+            cprint(f"  - sra_mask_ratio: {self.sra_mask_ratio} ({self.sra_num_mask_groups} group(s))", "yellow")
+            cprint(f"  - sra_teacher_t: {self.sra_teacher_t}", "yellow")
+            cprint(f"  - sra_loss_type: {self.sra_loss_type}", "yellow")
+            if self.sra_num_mask_groups > 1:
+                cprint(f"  - sra_dual_time_scheduling: {self.sra_dual_time_scheduling}", "yellow")
+                cprint(f"  - sra_attention_separation: {self.sra_attention_separation}", "yellow")
+                cprint(f"  - sra_teacher_mask: {self.sra_teacher_mask}", "yellow")
+                cprint(f"  - sra_full_sample_prob: {self.sra_full_sample_prob}", "yellow")
 
         print_params(self)
 
@@ -184,12 +217,167 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         aren't provided, e.g. when compute_loss is called from a context that
         doesn't track training progress.
         """
-        if not self.sra_weight_schedule or epoch is None or num_epochs is None or num_epochs <= 0:
+        if not self.sra_weight_schedule or num_epochs <= 0:
             return self.sra_loss_weight
         start = self.sra_weight_decay_start_frac * num_epochs
         span = self.sra_weight_decay_span_frac * num_epochs
         exponent = 1.0 if epoch <= start else (epoch - start) / span + 1.0
+        if epoch <= start:
+            return self.sra_loss_weight
+        # the weight during the decay period
+        exponent = (epoch - start) / span + 1.0
         return self.sra_loss_weight * self.sra_weight_base_scale * (0.1 ** exponent)
+
+        if exponent==1.0:
+            return self.sra_loss_weight * exponent
+        else:    
+            return self.sra_loss_weight * self.sra_weight_base_scale * (0.1 ** exponent)
+
+    def _sra_align_loss(self, student_repr, teacher_repr):
+        """Alignment loss between student/teacher representations, matching
+        SRA/SiT-SRA_DTS_AS's ``Simpleloss`` (loss.py)."""
+        if self.sra_loss_type == "sml1":
+            return F.smooth_l1_loss(student_repr, teacher_repr, beta=0.05)
+        elif self.sra_loss_type == "l2":
+            return F.mse_loss(student_repr, teacher_repr)
+        elif self.sra_loss_type == "l1":
+            return F.l1_loss(student_repr, teacher_repr)
+        elif self.sra_loss_type == "cos":
+            return (1 - F.cosine_similarity(student_repr, teacher_repr, dim=-1)).mean()
+        else:
+            raise NotImplementedError(f"Unsupported sra_loss_type {self.sra_loss_type}")
+
+    def _sample_sra_group_timesteps(self, batch_size, device):
+        """
+        Sample one timestep per mask group. Dual-time scheduling (DTS) samples
+        each group independently; otherwise every group shares the first
+        group's timestep (degenerates to a single shared timestep), mirroring
+        SRA/SiT-SRA_DTS_AS's ``SRALoss._sample_group_timesteps``.
+        """
+        first_t = self.sample_t(batch_size, mode=self.sample_t_mode_flow).to(device).reshape(-1)
+        if self.sra_num_mask_groups == 1 or not self.sra_dual_time_scheduling:
+            return [first_t for _ in range(self.sra_num_mask_groups)]
+        group_timesteps = [first_t]
+        for _ in range(1, self.sra_num_mask_groups):
+            group_timesteps.append(self.sample_t(batch_size, mode=self.sample_t_mode_flow).to(device).reshape(-1))
+        return group_timesteps
+
+    def _sra_target_t_for(self, t_group):
+        """Per-group target_t for the (dt=0) flow branch, matching get_flow_velocity."""
+        if self.sample_target_t_mode == "absolute":
+            return t_group
+        return torch.zeros_like(t_group)
+
+    def _build_sra_dts_mix(self, x_0, x_1):
+        """
+        Build the SRA/DTS/AS mixed-noise-level training input: split the
+        action horizon into `self.sra_num_mask_groups` token groups (each
+        sample gets its own random group assignment), give each group its own
+        timestep (dual-time scheduling), and mix the per-group interpolated
+        trajectories/timesteps into a single (B,T,...) sequence per token
+        group id. Mirrors SRA/SiT-SRA_DTS_AS's ``SRALoss.__call__`` masked branch.
+        """
+        batch_size, horizon = x_0.shape[0], x_0.shape[1]
+        device = x_0.device
+
+        group_ids = build_group_mask(
+            mask_ratio=self.sra_mask_ratio,
+            batch_size=batch_size,
+            seq_len=horizon,
+            device=device,
+            full_sample_prob=self.sra_full_sample_prob,
+        )  # (B, T)
+
+        group_timesteps = self._sample_sra_group_timesteps(batch_size, device)  # list of (B,)
+
+        x_t_groups = [self.linear_interpolate(x_0, x_1, t.view(-1, 1, 1)) for t in group_timesteps]
+        t_groups_tok = [t.view(-1, 1).expand(-1, horizon) for t in group_timesteps]  # (B, T) each
+        target_t_groups_tok = [
+            self._sra_target_t_for(t).view(-1, 1).expand(-1, horizon) for t in group_timesteps
+        ]
+
+        x_t_mixed = mix_group_values(x_t_groups, group_ids)
+        t_mixed = mix_group_values(t_groups_tok, group_ids)
+        target_t_mixed = mix_group_values(target_t_groups_tok, group_ids)
+
+        return {
+            "x_t_mixed": x_t_mixed,
+            "t_mixed": t_mixed,
+            "target_t_mixed": target_t_mixed,
+            "group_ids": group_ids,
+            "group_timesteps": group_timesteps,
+        }
+
+    def _compute_sra_teacher_repr(self, mix_out, x_0, x_1, vis_cond, lang_cond, ema_model, horizon):
+        """
+        Teacher (EMA) forward pass for the alignment loss, generalizing the
+        plain-SRA "sra"-offset teacher used when masking is disabled to also
+        cover SRA/SiT-SRA_DTS_AS's "self_flow" and "same" teacher_t modes.
+
+        Note on convention: SiT's forward flow runs clean(t=0) -> noise(t=1)
+        and picks the *smallest* group timestep as the cleanest view for
+        "self_flow"; ManiFlow's flow runs noise(t=0) -> clean(t=1), so the
+        analogous "cleanest available view" is the *largest* group timestep.
+        """
+        group_ids = mix_out["group_ids"]
+        group_timesteps = mix_out["group_timesteps"]
+        num_groups = len(group_timesteps)
+
+        if self.sra_teacher_mask:
+            mask_teacher = group_ids
+            if self.sra_teacher_t == "self_flow":
+                teacher_time_base = group_timesteps[0]
+                for t_group in group_timesteps[1:]:
+                    teacher_time_base = torch.maximum(teacher_time_base, t_group)
+                teacher_branch = self.linear_interpolate(x_0, x_1, teacher_time_base.view(-1, 1, 1))
+                teacher_groups = [teacher_branch] + [x_1 for _ in range(num_groups - 1)]
+                x_t_teacher = mix_group_values(teacher_groups, group_ids)
+                t_teacher = teacher_time_base.view(-1, 1).expand(-1, horizon)
+            elif self.sra_teacher_t == "same":
+                x_t_teacher = mix_out["x_t_mixed"]
+                t_teacher = mix_out["t_mixed"]
+            elif self.sra_teacher_t == "sra":
+                teacher_groups_t = [
+                    (t_group + self.sra_t_max * torch.rand_like(t_group)).clamp(max=1.0)
+                    for t_group in group_timesteps
+                ]
+                x_t_teacher_groups = [
+                    self.linear_interpolate(x_0, x_1, t.view(-1, 1, 1)) for t in teacher_groups_t
+                ]
+                x_t_teacher = mix_group_values(x_t_teacher_groups, group_ids)
+                t_teacher_groups_tok = [t.view(-1, 1).expand(-1, horizon) for t in teacher_groups_t]
+                t_teacher = mix_group_values(t_teacher_groups_tok, group_ids)
+            else:
+                raise NotImplementedError(f"Unsupported sra_teacher_t {self.sra_teacher_t}")
+        else:
+            mask_teacher = None
+            if self.sra_teacher_t != "self_flow":
+                raise NotImplementedError(
+                    "sra_teacher_mask=False only supports sra_teacher_t='self_flow' when masking is "
+                    "active (sra_num_mask_groups > 1), matching SRA/SiT-SRA_DTS_AS's loss.py"
+                )
+            teacher_time_base = group_timesteps[0]
+            for t_group in group_timesteps[1:]:
+                teacher_time_base = torch.maximum(teacher_time_base, t_group)
+            x_t_teacher = self.linear_interpolate(x_0, x_1, teacher_time_base.view(-1, 1, 1))
+            t_teacher = teacher_time_base.view(-1, 1).expand(-1, horizon)
+
+        target_t_teacher = torch.zeros_like(t_teacher)
+
+        with torch.no_grad():
+            # apply_sra_head intentionally omitted (defaults to False): the
+            # teacher representation stays un-projected, matching SRA/DiT-SRA
+            # where only the student passes through the predictor head.
+            _, teacher_repr = ema_model.model(
+                sample=x_t_teacher,
+                timestep=t_teacher,
+                target_t=target_t_teacher,
+                vis_cond=vis_cond,
+                lang_cond=lang_cond,
+                group_ids=mask_teacher if self.sra_attention_separation else None,
+                return_block_output=self.sra_block_out_t,
+            )
+        return teacher_repr
 
     # ========= inference  ============
     def conditional_sample(self, 
@@ -564,14 +752,37 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                                                     vis_cond=vis_cond[:flow_batchsize],
                                                     lang_cond=lang_cond[:flow_batchsize] if lang_cond is not None else None)
 
-        # Student forward pass — also returns intermediate block output when SRA is enabled
-        if self.use_sra:
+        # SRA/DTS/AS: when masking is active (sra_num_mask_groups > 1), the
+        # *main* denoising forward pass itself is replaced by the group-mixed,
+        # multiple-noise-level sequence - masking isn't just an auxiliary
+        # branch, matching SRA/SiT-SRA_DTS_AS's loss.py where `model_output_gen`
+        # (the primary flow-matching prediction) comes from the mixed input
+        # whenever a mask is built. With the default sra_mask_ratio=1.0 (a
+        # single group), sra_active_mask is always False and this reduces
+        # exactly to the plain-SRA forward pass below.
+        sra_active_mask = self.use_sra and self.sra_num_mask_groups > 1
+        sra_lang_cond = flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None
+
+        if sra_active_mask:
+            sra_mix = self._build_sra_dts_mix(flow_target_dict['x_0'], flow_target_dict['x_1'])
+            v_flow_pred, student_repr = self.model(
+                sample=sra_mix['x_t_mixed'],
+                timestep=sra_mix['t_mixed'],
+                target_t=sra_mix['target_t_mixed'],
+                vis_cond=vis_cond[:flow_batchsize],
+                lang_cond=sra_lang_cond,
+                group_ids=sra_mix['group_ids'] if self.sra_attention_separation else None,
+                return_block_output=self.sra_block_out_s,
+                apply_sra_head=True,
+            )
+        elif self.use_sra:
+            # Student forward pass — also returns intermediate block output when SRA is enabled
             v_flow_pred, student_repr = self.model(
                 sample=flow_target_dict['x_t'],
                 timestep=flow_target_dict['t'].squeeze(),
                 target_t=flow_target_dict['target_t'].squeeze(),
                 vis_cond=vis_cond[:flow_batchsize],
-                lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
+                lang_cond=sra_lang_cond,
                 return_block_output=self.sra_block_out_s,
                 apply_sra_head=True,
             )
@@ -581,14 +792,16 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
                 timestep=flow_target_dict['t'].squeeze(),
                 target_t=flow_target_dict['target_t'].squeeze(),
                 vis_cond=vis_cond[:flow_batchsize],
-                lang_cond=flow_target_dict['lang_cond'][:flow_batchsize] if lang_cond is not None else None,
+                lang_cond=sra_lang_cond,
             )
         v_flow_pred_magnitude = torch.sqrt(torch.mean(v_flow_pred ** 2)).item()
 
         """Compute losses"""
         loss = 0.
 
-        # compute flow loss
+        # compute flow loss. v_target = x_1 - x_0 is constant along the linear
+        # path regardless of timestep, so it needs no group-mixing even when
+        # sra_active_mask uses a per-token mix of x_t/t/target_t above.
         v_flow_target = flow_target_dict['v_target']
         loss_flow = F.mse_loss(v_flow_pred, v_flow_target, reduction='none')
         loss_flow = reduce(loss_flow, 'b ... -> b (...)', 'mean')
@@ -599,28 +812,47 @@ class ManiFlowTransformerImagePolicy(BasePolicy):
         # teacher EMA's later-block repr (low noise, larger t in maniflow)
         if self.use_sra:
             assert ema_model is not None, "ema_model is required for SRA training"
-            t_student = flow_target_dict['t'].squeeze()  # (B,)
-            delta_t_sra = self.sra_t_max * torch.rand_like(t_student)
-            t_teacher = (t_student + delta_t_sra).clamp(max=1.0)
-            x_t_teacher = self.linear_interpolate(
-                flow_target_dict['x_0'],
-                flow_target_dict['x_1'],
-                t_teacher.view(-1, 1, 1),
-            )
-            target_t_teacher = torch.zeros_like(t_teacher)  # instantaneous velocity
-            with torch.no_grad():
-                # apply_sra_head intentionally omitted (defaults to False): the
-                # teacher representation stays un-projected, matching SRA/DiT-SRA
-                # where only the student passes through the predictor head.
-                _, teacher_repr = ema_model.model(
-                    sample=x_t_teacher,
-                    timestep=t_teacher,
-                    target_t=target_t_teacher,
-                    vis_cond=vis_cond[:flow_batchsize],
-                    lang_cond=lang_cond[:flow_batchsize] if lang_cond is not None else None,
-                    return_block_output=self.sra_block_out_t,
+            if sra_active_mask:
+                teacher_repr = self._compute_sra_teacher_repr(
+                    sra_mix, flow_target_dict['x_0'], flow_target_dict['x_1'],
+                    vis_cond[:flow_batchsize], sra_lang_cond, ema_model, horizon,
                 )
-            loss_sra = F.smooth_l1_loss(student_repr, teacher_repr, beta=0.05)
+            else:
+                # plain SRA (no masking): teacher sees a single cleaner-by-delta
+                # view of the same trajectory ("sra" teacher_t offset), or the
+                # exact same (t, x_t) as the student ("self_flow" - trivial
+                # without masking, since there's only one timestep to reuse).
+                t_student = flow_target_dict['t'].squeeze()  # (B,)
+                if self.sra_teacher_t == "sra":
+                    delta_t_sra = self.sra_t_max * torch.rand_like(t_student)
+                    t_teacher = (t_student + delta_t_sra).clamp(max=1.0)
+                elif self.sra_teacher_t == "self_flow":
+                    t_teacher = t_student
+                else:
+                    raise NotImplementedError(
+                        f"sra_teacher_t={self.sra_teacher_t} requires masking "
+                        "(sra_mask_ratio with >1 group) to be meaningful, matching "
+                        "SRA/SiT-SRA_DTS_AS's loss.py"
+                    )
+                x_t_teacher = self.linear_interpolate(
+                    flow_target_dict['x_0'],
+                    flow_target_dict['x_1'],
+                    t_teacher.view(-1, 1, 1),
+                )
+                target_t_teacher = torch.zeros_like(t_teacher)  # instantaneous velocity
+                with torch.no_grad():
+                    # apply_sra_head intentionally omitted (defaults to False): the
+                    # teacher representation stays un-projected, matching SRA/DiT-SRA
+                    # where only the student passes through the predictor head.
+                    _, teacher_repr = ema_model.model(
+                        sample=x_t_teacher,
+                        timestep=t_teacher,
+                        target_t=target_t_teacher,
+                        vis_cond=vis_cond[:flow_batchsize],
+                        lang_cond=sra_lang_cond,
+                        return_block_output=self.sra_block_out_t,
+                    )
+            loss_sra = self._sra_align_loss(student_repr, teacher_repr)
             sra_weight = self._sra_effective_weight(epoch=epoch, num_epochs=num_epochs)
             loss += loss_sra * sra_weight
             loss_sra = loss_sra.item()

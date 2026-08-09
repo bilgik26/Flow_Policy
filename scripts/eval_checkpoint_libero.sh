@@ -9,7 +9,10 @@
 #   training_dir : Path to the training output directory that contains checkpoints/
 #                  (default: most recent run under ManiFlow/data/outputs/)
 #   eval_mode    : "latest" or "best" (lowest val_loss) (default: latest)
-#   task_suite   : task config name used at training time, e.g. "libero_spatial" (default: libero_spatial)
+#   task_suite   : task config name used at training time, e.g. "libero_spatial"
+#                  (default: libero_spatial). "libero_all4" (libero_spatial +
+#                  libero_object + libero_goal + libero_10 mixed) is also
+#                  supported for full_suite=true; see maniflow/config/task/libero_all4.yaml.
 #   full_suite   : "true" to evaluate every task in the suite (task_ids=null, official
 #                  LIBERO protocol), "false" to only run the single canonical task
 #                  used for periodic training rollouts (default: false)
@@ -17,7 +20,16 @@
 # Env vars (optional):
 #   TASK_IDS           : explicit Hydra list override, e.g. "[7,9]", to eval specific
 #                         task indices instead of the canonical task / full suite.
+#                         Only meaningful for single-suite task_suite values — for
+#                         "libero_all4" (fixed seen/unseen task split, see
+#                         maniflow/config/task/libero_all4.yaml) target
+#                         episode counts directly via EXTRA_OVERRIDES instead,
+#                         e.g. EXTRA_OVERRIDES="task.env_runner.unseen_episodes_per_task=50".
 #   EPISODES_PER_TASK   : episodes per task when TASK_IDS is set (default: 50)
+#   EXTRA_OVERRIDES     : extra space-separated Hydra overrides appended as-is,
+#                         e.g. "policy.use_sra=true" for checkpoints trained with
+#                         architecture flags that differ from the current default
+#                         config (needed to match state_dict keys on load).
 #
 # Output videos are saved to:
 #   <training_dir>/eval_results/<epoch>/steps10_<tag>/videos/taskNN_epNNN.mp4
@@ -88,7 +100,18 @@ export CUDA_VISIBLE_DEVICES="$GPU"
 
 TAG="canonical_task"
 FULL_SUITE_OVERRIDE=()
-if [[ "$FULL_SUITE" == "true" ]]; then
+if [[ "$FULL_SUITE" == "true" && "$TASK_SUITE" == "libero_all4" ]]; then
+    # libero_all4's env_runner always runs a fixed 2-task "seen" + 2-task
+    # "unseen" split per suite (task-level, see
+    # maniflow/config/task/libero_all4.yaml / LiberoRunner's suite_names
+    # mode) rather than evaluating every task in the suite, so full_suite=true
+    # here just raises the per-task episode count for a more thorough pass.
+    TAG="full_suite"
+    FULL_SUITE_OVERRIDE=(
+        "task.env_runner.seen_episodes_per_task=50"
+        "task.env_runner.unseen_episodes_per_task=50"
+    )
+elif [[ "$FULL_SUITE" == "true" ]]; then
     TAG="full_suite"
     FULL_SUITE_OVERRIDE=("task.env_runner.task_ids=null" "task.env_runner.eval_episodes_per_task=50")
 elif [[ -n "${TASK_IDS:-}" ]]; then
@@ -118,4 +141,5 @@ python -m maniflow.workspace.eval_maniflow_libero_workspace \
     "+eval_mode=$EVAL_MODE" \
     "+eval_dir_tag=$TAG" \
     "hydra.run.dir=$TRAINING_DIR" \
-    "${FULL_SUITE_OVERRIDE[@]}"
+    "${FULL_SUITE_OVERRIDE[@]}" \
+    ${EXTRA_OVERRIDES:-}

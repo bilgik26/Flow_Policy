@@ -17,7 +17,14 @@ from timm.models.vision_transformer import Mlp, use_fused_attn
 logger = logging.getLogger(__name__)
 
 def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    """
+    x, shift, scale: (B, T, D). Per-token modulation - the caller is
+    responsible for broadcasting a per-sample (non-per-token) conditioning
+    vector across T before calling this (see DiTX.forward), so this stays a
+    single elementwise op regardless of whether every token shares the same
+    condition or each token has its own (SRA/DTS mixed-noise-level training).
+    """
+    return x * (1 + scale) + shift
 
 class AdaptiveLayerNorm(nn.Module):
     def __init__(
@@ -161,9 +168,13 @@ class DiTXBlock(nn.Module):
         """
         Forward pass of the DiTX block.
         x: action, input tensor of shape (batch_size, seq_length, hidden_size)
-        time_c: time embedding, global context tensor of shape (batch_size, hidden_size)
+        time_c: per-token time/target_t embedding, shape (batch_size, seq_length, hidden_size).
+            Ordinary (non-SRA-masked) training shares the same value across all
+            T positions; SRA/DTS mixed-noise-level training gives different
+            positions different values (see DiTX.forward).
         context_c: visual and language tokens, context tensor of shape (batch_size, seq_length, hidden_size)
-        attn_mask: Optional attention mask of shape (batch_size, seq_length, seq_length)
+        attn_mask: Optional attention mask, (T, T) or (batch_size * num_heads, T, T),
+            True = blocked (see maniflow.model.diffusion.sra_mask.build_attention_separation_mask)
         """
 
         # adaLN modulation for self-attention, cross-attention, and MLP
@@ -185,18 +196,18 @@ class DiTXBlock(nn.Module):
         # Self-Attention with adaLN conditioning
         normed_x = modulate(self.norm1(x), shift_msa, scale_msa)  # Shape: (batch_size, seq_length, hidden_size)
         self_attn_output, _ = self.self_attn(normed_x, normed_x, normed_x, attn_mask=attn_mask)  # Shape: (batch_size, seq_length, hidden_size)
-        x = x + gate_msa.unsqueeze(1) * self_attn_output  # Apply gating and residual connection
-        
+        x = x + gate_msa * self_attn_output  # Apply gating and residual connection
+
 
         # Cross-Attention with adaLN conditioning
         normed_x_cross = modulate(self.norm2(x), shift_cross, scale_cross)  # Apply adaLN to x before cross-attn
         cross_attn_output = self.cross_attn(normed_x_cross, context_c, mask=None)  # Shape: (batch_size, seq_length, hidden_size)
-        x = x + gate_cross.unsqueeze(1) * cross_attn_output  # Apply gating and residual connection
-       
+        x = x + gate_cross * cross_attn_output  # Apply gating and residual connection
+
 
         # MLP with adaLN conditioning
         normed_x_mlp = modulate(self.norm3(x), shift_mlp, scale_mlp)
         mlp_output = self.mlp(normed_x_mlp)
-        x = x + gate_mlp.unsqueeze(1) * mlp_output  # Apply gating and residual connection
+        x = x + gate_mlp * mlp_output  # Apply gating and residual connection
 
         return x

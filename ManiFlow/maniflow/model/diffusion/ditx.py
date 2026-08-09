@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from timm.models.vision_transformer import Mlp, RmsNorm
 from maniflow.model.diffusion.positional_embedding import SinusoidalPosEmb
 from maniflow.model.diffusion.ditx_block import DiTXBlock, AdaptiveLayerNorm
+from maniflow.model.diffusion.sra_mask import build_attention_separation_mask
 from termcolor import cprint
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,7 @@ class DiTX(nn.Module):
         language_conditioned: bool=False,
         language_model: str = "t5-small",
         use_sra: bool = False,
+        attention_separation: bool = False,
     ):
         super().__init__()
         self.n_obs_steps = n_obs_steps
@@ -90,7 +92,13 @@ class DiTX(nn.Module):
         self.language_conditioned = language_conditioned
         self.pre_norm_modality = pre_norm_modality
         self.use_sra = use_sra
-        
+        # SRA/DTS/AS: block cross-group self-attention when `group_ids` is
+        # passed to forward() (see SRA/SiT-SRA_DTS_AS's GroupSeparatedAttention).
+        # Only takes effect together with a `group_ids` tensor; harmless no-op
+        # for ordinary (non-masked) training, which never passes group_ids.
+        self.attention_separation = attention_separation
+        self.num_heads = n_head
+
         # constants
         T = horizon
         self.T = T
@@ -403,6 +411,7 @@ class DiTX(nn.Module):
             target_t: Union[torch.Tensor, float, int],
             vis_cond: torch.Tensor,
             lang_cond: Union[torch.Tensor, list, str] = None,
+            group_ids: torch.Tensor = None,
             return_block_output: int = None,
             apply_sra_head: bool = False,
             **kwargs):
@@ -410,10 +419,22 @@ class DiTX(nn.Module):
         Forward pass of the DiTX model.
         Input:
             x: (B,T,input_dim)
-            timestep: (B,) or int, maniflow time step t
-            target_t: (B,) or float, the target absolute or relative time for the consistency flow training process
+            timestep: (B,), (B,T), or scalar - maniflow time step t. A (B,T)
+                tensor gives every action-horizon position its own timestep,
+                which is how SRA/DTS mixed-noise-level training feeds a single
+                sequence built from multiple noise levels (see
+                ManiFlowTransformerImagePolicy._build_sra_dts_mix).
+            target_t: (B,), (B,T), or scalar, the target absolute or relative
+                time for the consistency flow training process (same (B,T)
+                per-token option as `timestep`).
             vis_cond: (B,T, vis_cond_dim)
             lang_cond: (B,) or list of strings, language condition input
+            group_ids: optional (B,T) long tensor of token-group ids. Only
+                affects the model when `attention_separation=True`: cross-group
+                self-attention is then blocked, matching SRA/SiT-SRA_DTS_AS's
+                GroupSeparatedAttention. Ignored (no effect) otherwise - the
+                (B,T) mixing of `sample`/`timestep`/`target_t` across groups
+                already happens on the caller side.
             return_block_output: if set, also return the hidden state after this many
                 blocks have been processed (1-indexed, matching SRA/DiT-SRA's `ad`
                 convention: return_block_output=4 captures the output after block
@@ -429,39 +450,62 @@ class DiTX(nn.Module):
         # process input
         input_emb = self.input_emb(sample) # (B, T, n_emb)
         x = input_emb + self.pos_emb # (B, T, n_emb)
- 
+        batch_size = sample.shape[0]
+        seq_len = self.horizon
 
-        # 1. time
+        # 1. time (per-token: every block's adaLN modulation is computed
+        # per-position so plain and SRA/DTS-mixed training share the same code path)
         timesteps = timestep
         if not torch.is_tensor(timesteps):
             # TODO: this requires sync between CPU and GPU. So try to pass timesteps as tensors if you can
             timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
-        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+        elif torch.is_tensor(timesteps) and timesteps.dim() == 0:
             timesteps = timesteps[None].to(sample.device)
-        # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-        timesteps = timesteps.expand(sample.shape[0])
-        timestep_embed = self.flow_timestep_encoder(timesteps) # (B, n_emb)
-        
 
-        # 2. target_t
+        if timesteps.dim() == 1:
+            timesteps = timesteps.expand(batch_size)
+            timestep_embed = self.flow_timestep_encoder(timesteps)  # (B, n_emb)
+            timestep_embed_tok = timestep_embed.unsqueeze(1).expand(-1, seq_len, -1)  # (B, T, n_emb)
+        elif timesteps.dim() == 2:
+            # per-token timesteps, e.g. SRA/DTS mixed-noise-level training: (B, T)
+            timestep_embed_tok = self.flow_timestep_encoder(timesteps.reshape(-1)).reshape(
+                timesteps.shape[0], timesteps.shape[1], -1)
+            timestep_embed = timestep_embed_tok.mean(dim=1)  # reduced scalar, only for pre_norm_modality
+        else:
+            raise ValueError(f"timestep must be 0D/1D/2D, got shape {timesteps.shape}")
+
+        # 2. target_t (same 1D/2D handling as timestep)
         target_ts = target_t
-        if not torch.is_tensor(target_ts): 
-            target_ts = torch.tensor([target_ts], dtype=torch.float32, device=sample.device)    
-        elif torch.is_tensor(target_ts) and len(target_ts.shape) == 0:
+        if not torch.is_tensor(target_ts):
+            target_ts = torch.tensor([target_ts], dtype=torch.float32, device=sample.device)
+        elif torch.is_tensor(target_ts) and target_ts.dim() == 0:
             target_ts = target_ts[None].to(sample.device)
-        target_ts = target_ts.expand(sample.shape[0])
-        target_t_embed = self.flow_target_t_encoder(target_ts) # (B, n_emb)
-        
-        time_c = torch.cat([timestep_embed, target_t_embed], dim=-1) # (B, 2*n_emb)
-        time_c = self.timestep_target_t_adaptor(time_c) # (B, n_emb)
-        
+
+        if target_ts.dim() == 1:
+            target_ts = target_ts.expand(batch_size)
+            target_t_embed = self.flow_target_t_encoder(target_ts)  # (B, n_emb)
+            target_t_embed_tok = target_t_embed.unsqueeze(1).expand(-1, seq_len, -1)  # (B, T, n_emb)
+        elif target_ts.dim() == 2:
+            target_t_embed_tok = self.flow_target_t_encoder(target_ts.reshape(-1)).reshape(
+                target_ts.shape[0], target_ts.shape[1], -1)
+            target_t_embed = target_t_embed_tok.mean(dim=1)  # reduced scalar, only for pre_norm_modality
+        else:
+            raise ValueError(f"target_t must be 0D/1D/2D, got shape {target_ts.shape}")
+
+        time_c = self.timestep_target_t_adaptor(
+            torch.cat([timestep_embed_tok, target_t_embed_tok], dim=-1))  # (B, T, n_emb), per-token
+        # Reduced (B, n_emb) version for AdaptiveLayerNorm's per-sample (not
+        # per-token) conditioning of the vis/lang context below.
+        time_c_scalar = self.timestep_target_t_adaptor(
+            torch.cat([timestep_embed, target_t_embed], dim=-1))  # (B, n_emb)
+
 
         # 3. visual condition
         vis_con_obs_emb = self.vis_cond_obs_emb(vis_cond) # (B, L, n_emb)
         vis_cond_pos_embed = self.vis_cond_pos_embed[:, :vis_cond.shape[1]]
         context_c = vis_con_obs_emb + vis_cond_pos_embed # (B, L, n_emb)
         if self.pre_norm_modality:
-            context_c = self.vis_norm(context_c, time_c)
+            context_c = self.vis_norm(context_c, time_c_scalar)
 
 
         # 4. language condition
@@ -470,14 +514,22 @@ class DiTX(nn.Module):
             lang_c = self.encode_text_input_T5(lang_cond, output_type="token", device=sample.device) # (B, L_lang, 512)
             lang_c = self.lang_adaptor(lang_c) # (B, L, D) or (B, D)
             if self.pre_norm_modality:
-                lang_c = self.lang_norm(lang_c, time_c)
+                lang_c = self.lang_norm(lang_c, time_c_scalar)
             context_c = torch.cat([context_c, lang_c], dim=1) # (B, L + L_lang, n_emb)
 
+
+        # 4.5 SRA/DTS/AS attention-separation mask: block cross-group
+        # self-attention among action-horizon tokens (no effect on cross-attn
+        # to vis/lang context, matching SiT-SRA_DTS_AS where only the patch
+        # self-attention is separated).
+        attn_mask = None
+        if group_ids is not None and self.attention_separation:
+            attn_mask = build_attention_separation_mask(group_ids, self.num_heads)
 
         # 5. transformer blocks
         intermediate = None
         for i, block in enumerate(self.blocks):
-            x = block(x, time_c, context_c)  # (B, T, n_emb)
+            x = block(x, time_c, context_c, attn_mask=attn_mask)  # (B, T, n_emb)
             if return_block_output is not None and (i + 1) == return_block_output:
                 intermediate = self.sra_head(x) if apply_sra_head and self.use_sra else x
 

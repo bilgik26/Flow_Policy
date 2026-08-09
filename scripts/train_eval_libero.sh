@@ -15,12 +15,44 @@
 #   mode        : "train" (default) or "eval"
 #   task_suite  : "libero_spatial" (default) | "libero_object" | "libero_goal"
 #                 | "libero_10" | "libero_90" | "libero_test" (3-episode smoke test)
+#                 | "libero_all4" (libero_spatial + libero_object + libero_goal +
+#                   libero_10 mixed into one training set — "libero_10" is the
+#                   suite commonly called "LIBERO-Long"/"LIBERO-10" in papers;
+#                   see maniflow/config/task/libero_all4.yaml)
 #
 # Examples:
 #   bash scripts/train_eval_libero.sh 0 42                                   # libero_spatial, train, 1 GPU
 #   bash scripts/train_eval_libero.sh 0,1,2,3 42 libero_spatial_4gpu train libero_spatial  # 4-GPU DDP
 #   bash scripts/train_eval_libero.sh 0 42 libero_spatial_run eval libero_spatial
 #   bash scripts/train_eval_libero.sh 0 0   smoke        train libero_test    # quick smoke test
+#   bash scripts/train_eval_libero.sh 0,1,2,3 42 libero_all4_run train libero_all4  # all 4 suites mixed, 4-GPU DDP
+#   bash scripts/train_eval_libero.sh 0 42 libero_all4_run eval libero_all4        # eval on all 4 suites
+#
+# libero_all4 specifics (maniflow/config/task/libero_all4.yaml,
+# task_split_seed/val_tasks_per_suite/seen_tasks_per_suite): per suite (10
+# LIBERO tasks each), a *fixed* split -- independent of --seed above, so it
+# never changes across training runs -- holds out 2 whole tasks entirely
+# from training and picks 2 of the remaining 8 trained-on tasks to probe:
+#   - val_loss / val_loss_<suite>: BC loss on the 2 held-out tasks' episodes
+#     (maniflow/dataset/libero_dataset.py's val_tasks_per_suite split).
+#   - unseen_mean_success_rate_<suite>: rollout success rate on the 2
+#     held-out (never-trained-on) tasks, unseen_episodes_per_task episodes
+#     each.
+#   - seen_mean_success_rate_<suite>: rollout success rate on 2 of the 8
+#     trained-on tasks, seen_episodes_per_task episodes each -- no loss is
+#     computed for these, only rollout.
+# All four are logged to wandb every training.val_every / rollout_every
+# epochs (train mode) or once (eval mode) -- same config drives both modes.
+# See maniflow/env_runner/libero_runner.py's LiberoRunner docstring and
+# maniflow/common/libero_task_split.py for how the split is computed.
+#
+# Override individual values via extra hydra args (appended after
+# task_suite), e.g. to raise the "unseen" episode count for a more thorough
+# eval-mode run:
+#   bash scripts/train_eval_libero.sh 0 42 myrun eval libero_all4 \
+#       task.env_runner.unseen_episodes_per_task=50
+# (single-suite task configs keep using the plain task.env_runner.task_ids /
+# task.env_runner.eval_episodes_per_task overrides as before.)
 
 set -euo pipefail
 set -a

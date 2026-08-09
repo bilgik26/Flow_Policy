@@ -303,4 +303,18 @@ class LiberoDaliLoader:
 
             actions, states = self._gather_action_state(shard, batch_start)
             obs["agent_pos"] = states
+            # Not tensorized -- mirrors LiberoImageDataset.__getitem__'s
+            # "task_name" (see its docstring); language_conditioned policies
+            # read this as a (B,)-length list of strings.
+            obs["task_name"] = [
+                self.dataset._episodes[self._records[shard[batch_start + j]]["ep_i"]].language_instruction
+                for j in range(self.batch_size)
+            ]
+            # Mirrors LiberoImageDataset.__getitem__'s "task_suite_name" --
+            # lets a multi-suite mix like libero_all4's val loop bucket
+            # per-sample loss by suite even when DALI is used for val_dataloader.
+            obs["task_suite_name"] = [
+                self.dataset._episodes[self._records[shard[batch_start + j]]["ep_i"]].task_suite_name
+                for j in range(self.batch_size)
+            ]
             yield {"obs": obs, "action": actions}

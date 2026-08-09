@@ -30,6 +30,12 @@ Returns Flow_Policy's expected format:
     image:       (T, C, H, W) float32 [0, 1]  CHW layout, agentview camera
     wrist_image: (T, C, H, W) float32 [0, 1]  CHW layout, wrist camera
     agent_pos:   (T, 8)        float32
+    task_name:   str, the episode's LIBERO language instruction (not
+                 tensorized -- used by policy.language_conditioned models,
+                 see maniflow_image_policy.py's lang_cond)
+    task_suite_name: str, the episode's LIBERO suite (not tensorized --
+                 used to bucket per-suite val_loss for multi-suite mixes
+                 like libero_all4, see train_maniflow_libero_workspace.py)
   action:        (T, 7)        float32
 """
 
@@ -141,13 +147,41 @@ def _decode_video_frames(
 class _Episode:
     """Scalar data for one episode (kept in RAM; video decoded on demand)."""
 
-    __slots__ = ("actions", "states", "video_paths", "length")
+    __slots__ = (
+        "actions",
+        "states",
+        "video_paths",
+        "length",
+        "language_instruction",
+        "task_suite_name",
+    )
 
-    def __init__(self, actions, states, video_paths, length):
+    def __init__(
+        self,
+        actions,
+        states,
+        video_paths,
+        length,
+        language_instruction="libero",
+        task_suite_name="libero",
+    ):
         self.actions = actions            # (T, ACTION_DIM) float32
         self.states = states              # (T, STATE_DIM)  float32
         self.video_paths = video_paths    # dict: image_key -> path str
         self.length = length
+        # Natural-language task instruction, e.g. "put the bowl on the
+        # plate" -- identical string to LiberoEnv.task_description (both
+        # come from LIBERO's task.language, see libero_wrapper.py and
+        # scripts/convert_libero_to_lerobot.py's info.json["task_description"]),
+        # so a policy trained on this matches what it sees at rollout time.
+        self.language_instruction = language_instruction
+        # Which LIBERO suite (e.g. "libero_spatial") this episode came from --
+        # the name of the top-level dataset_dirs entry it was discovered
+        # under (see __init__'s load loop). Combined with
+        # language_instruction this identifies the episode's task within a
+        # multi-suite mix like libero_all4, which is otherwise lost once all
+        # suites' episodes are flattened into one all_episodes list.
+        self.task_suite_name = task_suite_name
 
 
 class LiberoImageDataset(BaseDataset):
@@ -173,9 +207,29 @@ class LiberoImageDataset(BaseDataset):
         Steps padded at the *end* of each episode (repeat last frame).
         Typically ``n_action_steps - 1``.
     seed : int
-        RNG seed for reproducible train/val split.
+        RNG seed for reproducible train/val split (ratio-based path only,
+        i.e. when ``val_tasks_per_suite`` is None).
     val_ratio : float
-        Fraction of episodes held out for validation.
+        Fraction of episodes held out for validation. Ignored when
+        ``val_tasks_per_suite`` is set.
+    val_tasks_per_suite : int or None
+        If set, overrides the ratio-based split above with a *task-level*
+        split: per suite, this many whole LIBERO tasks (all their episodes)
+        are held out entirely for validation, and the rest are used
+        entirely for training -- e.g. for libero_all4, 2 of each suite's 10
+        tasks go to val, 8 to train, rather than every task contributing a
+        few val episodes each. Which task_ids are held out is computed by
+        ``maniflow.common.libero_task_split.split_train_val_tasks`` from
+        ``task_split_seed`` below (not ``seed``), matching what
+        ``LiberoRunner``'s "unseen" rollout eval independently computes
+        with the same suite name/count/seed -- so the dataset's held-out
+        tasks and the runner's "unseen" rollout tasks are always the same
+        tasks, without the two needing to communicate directly.
+    task_split_seed : int
+        RNG seed for the ``val_tasks_per_suite`` split, deliberately
+        separate from ``seed`` so which tasks are held out stays identical
+        across training runs regardless of what seed a given run trains
+        with. Only used when ``val_tasks_per_suite`` is set.
     max_train_episodes : int or None
         Cap on the number of training episodes (across all discovered dirs).
     image_size : int
@@ -199,6 +253,8 @@ class LiberoImageDataset(BaseDataset):
         pad_after: int = 7,
         seed: int = 42,
         val_ratio: float = 0.02,
+        val_tasks_per_suite: Optional[int] = None,
+        task_split_seed: int = 0,
         max_train_episodes: Optional[int] = None,
         image_size: int = 256,
         task_name: Optional[str] = None,
@@ -217,19 +273,56 @@ class LiberoImageDataset(BaseDataset):
         self.use_wrist_image = use_wrist_image
 
         # ── Load all episodes ──────────────────────────────────────────────
+        # Each dataset_dirs entry is one suite root (e.g. ".../libero_spatial");
+        # its directory name matches the LIBERO benchmark suite key across
+        # every task/*.yaml in this repo, so it doubles as this episode
+        # batch's task_suite_name without needing a separate config field.
         all_episodes: List[_Episode] = []
         for ds_dir in dataset_dirs:
+            suite_name = pathlib.Path(ds_dir).name
             for resolved in _discover_lerobot_dirs(pathlib.Path(ds_dir)):
                 cprint(f"Loading LiberoDataset from {resolved}", "green")
-                all_episodes.extend(self._load_dir(resolved))
+                all_episodes.extend(self._load_dir(resolved, suite_name))
         cprint(f"Total episodes: {len(all_episodes)}", "green")
 
         # ── Train / val split ──────────────────────────────────────────────
         n = len(all_episodes)
-        rng = np.random.default_rng(seed)
-        perm = rng.permutation(n)
-        n_val = max(1, int(n * val_ratio))
-        val_set = set(perm[:n_val].tolist())
+        if val_tasks_per_suite is not None:
+            # Task-level split: per suite, val_tasks_per_suite whole tasks
+            # (all their episodes) go to val, the rest go entirely to
+            # train. Which task_ids are held out is a pure function of
+            # (suite name, suite's n_tasks, val_tasks_per_suite,
+            # task_split_seed) -- independent of `seed` (== training.seed)
+            # and computed identically by LiberoRunner's "unseen" rollout
+            # eval, see split_train_val_tasks's docstring.
+            from libero.libero import benchmark as libero_benchmark
+
+            from maniflow.common.libero_task_split import split_train_val_tasks
+
+            suites_present = sorted({ep.task_suite_name for ep in all_episodes})
+            val_task_ids_by_suite: Dict[str, set] = {}
+            lang_to_task_id_by_suite: Dict[str, Dict[str, int]] = {}
+            for suite_name in suites_present:
+                task_suite = libero_benchmark.get_benchmark_dict()[suite_name]()
+                lang_to_task_id_by_suite[suite_name] = {
+                    task_suite.get_task(i).language: i for i in range(task_suite.n_tasks)
+                }
+                _, val_task_ids = split_train_val_tasks(
+                    suite_name, task_suite.n_tasks, val_tasks_per_suite, task_split_seed
+                )
+                val_task_ids_by_suite[suite_name] = set(val_task_ids)
+
+            val_set = {
+                i
+                for i, ep in enumerate(all_episodes)
+                if lang_to_task_id_by_suite[ep.task_suite_name][ep.language_instruction]
+                in val_task_ids_by_suite[ep.task_suite_name]
+            }
+        else:
+            rng = np.random.default_rng(seed)
+            perm = rng.permutation(n)
+            n_val = max(1, int(n * val_ratio))
+            val_set = set(perm[:n_val].tolist())
 
         train_idx = [i for i in range(n) if i not in val_set]
         if max_train_episodes is not None:
@@ -266,9 +359,13 @@ class LiberoImageDataset(BaseDataset):
     # ─── Internal helpers ───────────────────────────────────────────────────
 
     @staticmethod
-    def _load_dir(ds_dir: pathlib.Path) -> List[_Episode]:
+    def _load_dir(ds_dir: pathlib.Path, task_suite_name: str = "libero") -> List[_Episode]:
         info = json.loads((ds_dir / "meta" / "info.json").read_text())
         chunks_size = info.get("chunks_size", 1000)
+        # Every LeRobot dir discovered here holds exactly one LIBERO task
+        # (see _discover_lerobot_dirs), so one instruction string covers all
+        # of its episodes.
+        language_instruction = info.get("task_description", ds_dir.name.replace("_", " "))
 
         episodes = []
         with open(ds_dir / "meta" / "episodes.jsonl") as f:
@@ -309,6 +406,8 @@ class LiberoImageDataset(BaseDataset):
                         states,
                         {k: str(v) for k, v in video_paths.items()},
                         ep_len,
+                        language_instruction,
+                        task_suite_name,
                     )
                 )
         return episodes
@@ -329,6 +428,22 @@ class LiberoImageDataset(BaseDataset):
         val._samples = self._val_samples
         val._episodes = self.val_episodes
         return val
+
+    def get_validation_dataset_per_suite(self) -> Dict[str, "LiberoImageDataset"]:
+        """One validation-split dataset per distinct task_suite_name present
+        in the val episodes (e.g. libero_all4's spatial/object/goal/10) --
+        lets the training loop compute a separate val_loss per suite instead
+        of only the pooled/global one. Suites with zero val episodes are
+        omitted."""
+        suites = sorted({ep.task_suite_name for ep in self.val_episodes})
+        result = {}
+        for suite in suites:
+            episodes = [ep for ep in self.val_episodes if ep.task_suite_name == suite]
+            val = copy.copy(self)
+            val._episodes = episodes
+            val._samples = self._build_index(episodes)
+            result[suite] = val
+        return result
 
     def get_normalizer(self, mode: str = "limits", **kwargs) -> LinearNormalizer:
         normalizer = LinearNormalizer()
@@ -381,4 +496,14 @@ class LiberoImageDataset(BaseDataset):
             "obs": obs,
             "action": actions,                # (T, 7)       float32
         }
-        return dict_apply(data, torch.from_numpy)
+        data = dict_apply(data, torch.from_numpy)
+        # Not tensorized (dict_apply above only touches numeric arrays):
+        # language_conditioned policies read this as a (B,)-length list of
+        # strings once collated, see maniflow_image_policy.py's lang_cond.
+        data["obs"]["task_name"] = ep.language_instruction
+        # Also a (B,)-length list of strings once collated -- lets a
+        # multi-suite mix like libero_all4's val loop bucket per-sample loss
+        # by suite (see train_maniflow_libero_workspace.py's validation
+        # section). Not used by the model/normalizer.
+        data["obs"]["task_suite_name"] = ep.task_suite_name
+        return data
